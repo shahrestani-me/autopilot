@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="t">
+  <title id="t">Autopilot</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#8B3DF0"/>
+    </linearGradient>
+    <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E4E1FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <!-- the course: a dotted flight path from where the ticket starts, up into the "A" -->
+  <path d="M104 424 C176 436 250 418 272 362" fill="none" stroke="#FFFFFF" stroke-opacity="0.6"
+        stroke-width="18" stroke-linecap="round" stroke-dasharray="0 34"/>
+  <circle cx="104" cy="424" r="24" fill="#FFFFFF"/>
+  <!-- the navigation arrow, which is also the letter A -->
+  <path d="M286 92 L396 352 L286 300 L176 352 Z" fill="url(#shade)" stroke="url(#shade)"
+        stroke-width="28" stroke-linejoin="round"/>
+</svg>

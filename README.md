@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="112" alt="Autopilot logo"></p>
+
 # Autopilot
 
 A Linear agent that works the issues you **delegate** to it. It runs Claude Code on the owner's Mac
@@ -56,6 +58,7 @@ Merges reach preprod only; prod is released by hand. Setting it up for a company
 | `gateway/` | Cloudflare Worker + D1: Linear agent-session and GitHub mention webhooks, instant "Queued" ack, job queue ([docs](docs/gateway.md)) |
 | `schema/autopilot.schema.json` | per-project config schema |
 | `examples/` | a generic `web-app` config and the `sandbox` smoke-test config. Real project configs live in `~/.config/autopilot/projects/`, never here |
+| `assets/` | the logo (`logo.svg`) |
 | `docs/` | [company setup guide](docs/company-setup.md), [setup](docs/setup.md), [gateway](docs/gateway.md), [architecture + decisions](docs/architecture.md), [lessons learned](docs/lessons-learned.md) |
 
 ## Commands in Claude
