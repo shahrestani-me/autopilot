@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""autopilot-stream: mirror an Autopilot run into its issue's Linear agent session, live.
+
+A Claude Code hook (hooks/hooks.json: PostToolUse and Stop) runs this with the hook's JSON on
+stdin. It only acts in a session that took an Autopilot issue lock (a Bash call printed
+autopilot-inflight's `{"locked": true, "name": "ENG-1", ...}`); every other session, interactive
+ones included, is untouched. Detection reads the output, not the command, because runs call the
+helper through a variable ("$AI" lock ENG-1).
+
+For such a session it posts, as Autopilot, into the run's session on that issue:
+  - first, which agent runs it and its Claude session id, as a `thought`: "Run by Agent 2
+    (`autopilot-agent-2`) · Claude session `…`", so the owner can find the run in the Claude
+    scheduler. The agent comes from `slot take --agent` (bin/autopilot-runstate's record);
+  - each new piece of Claude's text since the last call, as a `thought`;
+  - each tool call, as an `action`: the tool, a short parameter and a short result.
+Calls that already post to Linear themselves (autopilot-linear) or only manage locks
+(autopilot-inflight) and tool loading (ToolSearch) are left out. Secrets are redacted and long
+text is trimmed. `autopilot-inflight unlock <ID>` or the end of the run (Stop) flushes and stops.
+
+It never fails the run: every error is logged to $STATE/stream.log and the hook exits 0.
+AUTOPILOT_STREAM=0 turns it off.
+
+State: $AUTOPILOT_STATE_DIR (default ~/.local/state/autopilot)/streams/<claude session id>.json
+       {"issue": "ENG-1", "offset": <bytes of the transcript already mirrored>,
+        "agent": "autopilot-agent-2"|null, "announce": true until the first line above is posted}
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import sys
+import traceback
+
+STATE_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_STATE_DIR", "~/.local/state/autopilot"))
+ISSUE_ID = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# The helpers post to Linear themselves (autopilot-linear) or only manage locks (autopilot-inflight);
+# runs call them by path or through "$AP" / "$AI".
+QUIET_BASH = re.compile(r"autopilot-(linear|inflight)\b|\$\{?A[PI]\}?\b")
+QUIET_TOOLS = {"ToolSearch"}
+# The run's own closing activity: after it, the session is done (more posts would reopen it).
+CLOSING = re.compile(r"--type\s+['\"]?(response|elicitation|error)\b")
+# Output that must never leave the machine, whatever it contains.
+HIDDEN_OUTPUT = re.compile(r"security\s+find-generic-password|\bprintenv\b|(^|[;&|]\s*)env\s*($|[;&|])|\bgh\s+auth\s+token\b")
+IDS_KEPT = 200
+THOUGHT_MAX, PARAM_MAX, RESULT_MAX = 2000, 300, 500
+
+SECRETS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[private key]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[github token]"),
+    (re.compile(r"\b(lin_api|lin_oauth)_[A-Za-z0-9]{16,}"), "[linear token]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "[api key]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[aws key]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[google api key]"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[slack token]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[jwt]"),
+    (re.compile(r"(?i)\b(bearer|token)\s+[A-Za-z0-9._~+/=-]{16,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b([a-z_]*(?:password|secret|token|api_key)[a-z_]*)\s*[=:]\s*\S+"), r"\1=[redacted]"),
+    # Anything else that looks like a credential: 32+ chars mixing upper, lower and digits (git
+    # SHAs and UUIDs are lower-case hex, so they stay readable).
+    (re.compile(r"\b(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}\b"), "[redacted]"),
+]
+
+
+def redact(text):
+    for pattern, repl in SECRETS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def trim(text, limit):
+    text = redact(str(text)).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def one_line(text, limit):
+    return trim(" ⏎ ".join(l.strip() for l in str(text).splitlines() if l.strip()), limit)
+
+
+def _load(name):
+    path = pathlib.Path(__file__).resolve().parent / name
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# ---- what to post (pure, unit-tested)
+
+def describe_tool(name, tool_input, tool_response):
+    """(action, parameter, result) for a tool call, or None to leave it out."""
+    tool_input = tool_input or {}
+    if name in QUIET_TOOLS:
+        return None
+    if name == "Bash":
+        cmd = tool_input.get("command") or ""
+        if QUIET_BASH.search(cmd):
+            return None
+        if HIDDEN_OUTPUT.search(cmd):
+            return "Bash", one_line(cmd, PARAM_MAX), "(output hidden)"
+        out = tool_response if isinstance(tool_response, dict) else {"stdout": str(tool_response or "")}
+        text = (out.get("stdout") or "").strip()
+        err = (out.get("stderr") or "").strip()
+        tail = text[-RESULT_MAX:] if text else err[-RESULT_MAX:]
+        return "Bash", one_line(cmd, PARAM_MAX), one_line(tail, RESULT_MAX) or "(no output)"
+    if name in ("Read", "Write", "Edit", "NotebookEdit"):
+        path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        result = "ok"
+        if name == "Read" and isinstance(tool_response, dict):
+            lines = (tool_response.get("file") or {}).get("numLines")
+            result = f"{lines} lines" if lines else "ok"
+        return name, trim(path, PARAM_MAX), result
+    if name in ("Grep", "Glob"):
+        return name, trim(tool_input.get("pattern") or "", PARAM_MAX), trim(_short(tool_response), RESULT_MAX)
+    if name == "Skill":
+        return "Skill", trim(f"{tool_input.get('skill', '')} {tool_input.get('args') or ''}", PARAM_MAX), "loaded"
+    if name in ("Agent", "Task"):
+        return "Subagent", trim(tool_input.get("description") or "", PARAM_MAX), trim(_short(tool_response), RESULT_MAX)
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        label = f"{parts[-1]} ({parts[1].split('-')[-1] if len(parts) > 2 else 'mcp'})"
+        return label, one_line(_short(tool_input), PARAM_MAX), one_line(_short(tool_response), RESULT_MAX)
+    return name, one_line(_short(tool_input), PARAM_MAX), one_line(_short(tool_response), RESULT_MAX)
+
+
+def _short(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def read_new(transcript_path, offset):
+    """The main thread's new entries after `offset` bytes: ([(text, end offset), ...], tool_use ids,
+    new offset). Only whole lines are read, so a line still being written comes next time. A
+    transcript shorter than the offset was rewritten: restart from its current end."""
+    size = os.path.getsize(transcript_path)
+    if offset > size:
+        offset = size
+    texts, ids = [], []
+    with open(transcript_path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    pos = offset
+    for raw in data.splitlines(keepends=True):
+        if not raw.endswith(b"\n"):
+            break
+        pos += len(raw)
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        for block in (entry.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text", "").strip():
+                texts.append((trim(block["text"], THOUGHT_MAX), pos))
+            elif block.get("type") == "tool_use" and block.get("id"):
+                ids.append(block["id"])
+    return texts, ids, pos
+
+
+# ---- state
+
+def _state_path(session_id):
+    return os.path.join(STATE_DIR, "streams", f"{session_id}.json")
+
+
+def read_state(session_id):
+    try:
+        with open(_state_path(session_id)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_state(session_id, state):
+    path = _state_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(state, f)
+    os.replace(path + ".tmp", path)
+
+
+def drop_state(session_id):
+    try:
+        os.remove(_state_path(session_id))
+    except FileNotFoundError:
+        pass
+
+
+def _helper_objects(tool_response):
+    """Every JSON object printed in a Bash call's output (a run may chain several helper calls)."""
+    out = tool_response.get("stdout") if isinstance(tool_response, dict) else str(tool_response or "")
+    out, dec, i = out or "", json.JSONDecoder(), 0
+    while True:
+        i = out.find("{", i)
+        if i < 0:
+            return
+        try:
+            obj, end = dec.raw_decode(out, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        i = end
+
+
+def took_issue_lock(tool_response):
+    for data in _helper_objects(tool_response):
+        name = data.get("name") or ""
+        if data.get("locked") is True and ISSUE_ID.match(name):
+            return name
+    return None
+
+
+def run_agent(session_id, tool_response):
+    """The scheduled task that started this run: from a `slot take` in this same call, else from
+    the run record bin/autopilot-runstate keeps. None for a manual run."""
+    for data in _helper_objects(tool_response):
+        if isinstance(data.get("slot"), int) and data.get("token"):
+            return data.get("agent")
+    try:
+        with open(os.path.join(STATE_DIR, "runs", f"{session_id}.json")) as f:
+            return json.load(f).get("agent")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def released_issue_lock(tool_response):
+    for data in _helper_objects(tool_response):
+        name = data.get("unlocked") or ""
+        if ISSUE_ID.match(name):
+            return name
+    return None
+
+
+# ---- the hook
+
+def _safe(post):
+    """One failed post is logged and skipped; the rest still go out, and none is sent twice."""
+    def wrapped(issue, content, state):
+        try:
+            return post(issue, content, state)
+        except Exception:
+            _log()
+            return None
+    return wrapped
+
+
+def _log():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "stream.log")
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            os.replace(path, path + ".1")  # keep one old log, never grow without bound
+        with open(path, "a") as f:
+            f.write(traceback.format_exc() + "\n")
+    except OSError:
+        pass
+
+
+def handle(event, post):
+    """`post(issue, content, state)` posts one activity; it may note the Linear session it posted to
+    in `state`, which this saves. Returns what it posted (for tests)."""
+    post = _safe(post)
+    if os.environ.get("AUTOPILOT_STREAM") == "0":
+        return []
+    sid = event.get("session_id") or ""
+    if not SESSION_ID.match(sid):
+        return []
+    transcript = event.get("transcript_path") or ""
+    kind = event.get("hook_event_name")
+    tool = event.get("tool_name") or ""
+    tool_input = event.get("tool_input") or {}
+    response = event.get("tool_response")
+    state = read_state(sid)
+
+    # Start: this session just took an issue lock.
+    if state is None:
+        issue = took_issue_lock(response) if kind == "PostToolUse" and tool == "Bash" else None
+        if issue:
+            size = os.path.getsize(transcript) if transcript and os.path.exists(transcript) else 0
+            write_state(sid, {"issue": issue, "offset": size, "agent": run_agent(sid, response), "announce": True})
+        return []
+
+    issue, posted = state["issue"], []
+    if state.pop("announce", False):
+        # Before any of the run's own output, so it heads the run's part of the session.
+        posted.append(post(issue, {"type": "thought", "body": f"{_load('autopilot-runstate').run_by(state.get('agent'))} · Claude session `{sid}`"}, state))
+        write_state(sid, state)
+    if transcript and os.path.exists(transcript):
+        texts, ids, end = read_new(transcript, state.get("offset", 0))
+        state["ids"] = (state.get("ids", []) + ids)[-IDS_KEPT:]
+        for text, at in texts:
+            posted.append(post(issue, {"type": "thought", "body": text}, state))
+            state["offset"] = at  # saved after each post: a killed hook neither loses nor repeats much
+            write_state(sid, state)
+        state["offset"] = end
+        write_state(sid, state)
+    if kind == "PostToolUse":
+        # A subagent's tool calls fire this hook too, but never appear in the main thread.
+        use_id = event.get("tool_use_id")
+        mine = not use_id or use_id in state.get("ids", [])
+        desc = describe_tool(tool, tool_input, response) if mine else None
+        if desc:
+            action, parameter, result = desc
+            posted.append(post(issue, {"type": "action", "action": action, "parameter": parameter or "-", "result": result or "-"}, state))
+            write_state(sid, state)
+        cmd = (tool_input.get("command") or "") if tool == "Bash" else ""
+        if tool == "Bash" and (released_issue_lock(response) == issue or (QUIET_BASH.search(cmd) and CLOSING.search(cmd))):
+            drop_state(sid)  # unlocked, or the run posted its final word: the session is done
+    elif kind in ("Stop", "SessionEnd"):
+        drop_state(sid)
+    return posted
+
+
+def _post_via_linear(session_id):
+    apl = _load("autopilot-linear")
+    lin = apl.Linear(expect_session=apl.expect_own_session(apl.Gateway()))
+
+    def post(issue, content, state):
+        # The run's session: its claimed job's, else resolved once and kept in the stream state.
+        # Kept in the caller's state, which handle() saves: written here, its next save overwrote
+        # it, and every post opened yet another session.
+        cur = apl.read_current_job(issue)
+        target = (cur or {}).get("sessionId") or state.get("linearSession")
+        if not target:
+            target = state["linearSession"] = lin.ensure_session(issue)
+        lin.activity(issue, content, False, target)
+        return content
+    return post
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+        if event.get("hook_event_name") not in ("PostToolUse", "Stop", "SessionEnd"):
+            return 0
+        state = read_state(event.get("session_id") or "-") if SESSION_ID.match(event.get("session_id") or "") else None
+        starting = event.get("tool_name") == "Bash" and took_issue_lock(event.get("tool_response"))
+        if state is None and not starting:
+            return 0  # not an Autopilot run: no Keychain, no network
+        handle(event, _post_via_linear(event["session_id"]) if state else (lambda issue, content, state: content))
+    except Exception:  # never fail the run over its mirror
+        _log()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

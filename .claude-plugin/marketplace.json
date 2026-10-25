@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "autopilot",
+  "description": "Private marketplace for the Autopilot Linear agent plugin",
+  "owner": { "name": "Kamyar Shahrestani" },
+  "plugins": [
+    {
+      "name": "autopilot",
+      "description": "Works Linear tickets delegated to the Autopilot app with Claude Code",
+      "source": "./"
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+Autopilot Source-Available License
+
+Copyright (c) 2026 Kamyar Shahrestani. All rights reserved.
+
+This license covers the software in this repository (the "Software"). By using the Software you
+accept these terms.
+
+1. What you may do
+
+   a. Read and study the Software's source code.
+   b. Install and run unmodified copies of the Software, for yourself or for your organization,
+      including for internal commercial purposes.
+   c. Create and change your own configuration and deployment files for the Software (for example
+      project configs under ~/.config/autopilot/ and gateway/wrangler.toml), as its documentation
+      describes. These files are yours.
+   d. Make copies only as needed to do the above (for example cloning the repository or installing
+      the plugin).
+
+2. What you may not do
+
+   a. Modify, adapt, translate or create derivative works of the Software, other than the
+      configuration and deployment files in 1(c).
+   b. Distribute, publish, sublicense, sell, rent or lease the Software or any part of it, modified
+      or not, or offer it to third parties as a hosted or managed service.
+   c. Remove or change any copyright, license or attribution notice in the Software.
+   d. Claim authorship or ownership of the Software, or present it as your own work.
+
+3. Ownership
+
+   The Software is licensed, not sold. The copyright holder keeps all right, title and interest in
+   the Software. No rights are granted except those stated in section 1.
+
+4. Contributions
+
+   Suggestions, issues and pull requests are welcome. By submitting a contribution you grant the
+   copyright holder a perpetual, worldwide, royalty-free, irrevocable license to use, modify and
+   distribute it as part of the Software, under this or any other license.
+
+5. Termination
+
+   If you break these terms, your rights under this license end automatically. They are restored if
+   you stop the breach within 30 days of becoming aware of it, unless you have broken these terms
+   before.
+
+6. No warranty and no liability
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+   NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER DEALINGS IN THE SOFTWARE. You are responsible
+   for what the Software does in your accounts, repositories and environments.
+
+For any use not allowed here, ask the copyright holder for permission.

@@ -1,0 +1,1263 @@
+#!/usr/bin/env python3
+"""autopilot-linear: a small Linear GraphQL client that acts as the Autopilot app.
+
+Every write (comment, agent activity, status change) goes out with the app's
+own token, so Linear shows it as "Autopilot", not as the owner.
+
+Credentials come only from the macOS Keychain, service "autopilot-linear":
+  client-id      the OAuth app's client ID      (stored by the owner)
+  client-secret  the OAuth app's client secret  (stored by the owner)
+  access-token   cached app token. This tool mints it with the
+                 client_credentials grant (actor=app, valid 30 days) and keeps
+                 its expiry in the item's comment.
+The token is never printed, logged or written to a file. See docs/setup.md.
+
+With the phase 2 gateway (docs/gateway.md) set up, Keychain service "autopilot-gateway":
+  url            the gateway's base URL
+  token          the shared runner token (also a Worker secret)
+`queue` then pulls jobs from the gateway instead of polling Linear, and `jobs`
+claims and finishes them. AUTOPILOT_GATEWAY=off forces Linear polling.
+
+Output is JSON on stdout. Errors go to stderr with exit code 1
+(2 for missing setup).
+"""
+
+import argparse
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SERVICE = "autopilot-linear"
+GATEWAY_SERVICE = "autopilot-gateway"
+STATE_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_STATE_DIR", "~/.local/state/autopilot"))
+API_URL = "https://api.linear.app/graphql"
+TOKEN_URL = "https://api.linear.app/oauth/token"
+# Requesting a different scope set revokes every existing app token, so this
+# string must stay stable. Override only while debugging an install.
+SCOPES = os.environ.get("AUTOPILOT_LINEAR_SCOPES", "read,write,app:assignable,app:mentionable")
+REFRESH_MARGIN_S = 24 * 3600
+DEFAULT_TOKEN_LIFETIME_S = 30 * 24 * 3600  # Linear's documented client-credentials lifetime
+KEYCHAIN_TIMEOUT_S = 15
+HTTP_RETRIES = 3
+EXPECT_TIMEOUT_S = 4  # Gateway.expect_session runs inside hooks with a 15 s timeout
+TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]+")
+COMMENT_RE = re.compile(r"[A-Za-z0-9=._-]*")
+
+# Linear priority: 1 Urgent, 2 High, 3 Medium, 4 Low, 0 None (sorts last).
+PRIORITY_RANK = {1: 0, 2: 1, 3: 2, 4: 3, 0: 4}
+WAITING_STATUSES = {"awaitingInput", "error"}
+
+# Connections below use `first: N, orderBy: createdAt`: Linear returns the newest
+# first, so the newest replies and markers are always in the page.
+# Until the app has "Agent session events" webhooks (phase 2 gateway), Linear refuses
+# agent sessions. Activities then fall back to comments; these prefixes mark the ones
+# that wait for the owner, and the queue holds the issue until a human replies.
+FALLBACK_PREFIX = {
+    "elicitation": "🔴 **Autopilot needs you**\n\n",
+    "error": "⚠️ **Autopilot stopped**\n\n",
+    "response": "",
+}
+HOLD_MARKERS = (FALLBACK_PREFIX["elicitation"].split("\n")[0], FALLBACK_PREFIX["error"].split("\n")[0])
+
+
+def sessions_disabled(err):
+    msg = str(err).lower()
+    return "agent session" in msg and "disabled" in msg
+
+
+class SetupError(Exception):
+    """Keychain items are missing; the owner has to run docs/setup.md."""
+
+
+class LinearError(Exception):
+    pass
+
+
+class AuthError(LinearError):
+    pass
+
+
+class NotFoundError(LinearError):
+    pass
+
+
+class GatewayDown(LinearError):
+    """Network error or 5xx from the gateway: worth falling back to Linear polling."""
+
+
+# --------------------------------------------------------------------------
+# Keychain
+
+
+class Keychain:
+    """Reads and writes generic passwords with /usr/bin/security.
+
+    Secrets are passed on stdin (security -i), never on argv, so they don't
+    show up in `ps`. Every call has a timeout: a locked Keychain or a GUI
+    prompt must fail an unattended run, not hang it.
+    """
+
+    NOT_FOUND = 44  # errSecItemNotFound, as security's exit status
+
+    def __init__(self, run=subprocess.run, service=SERVICE):
+        self._run = run
+        self.service = service
+
+    def _security(self, args, stdin=None):
+        try:
+            return self._run(["security", *args], input=stdin, capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise LinearError("the Keychain did not answer (locked, or waiting for a prompt?)") from None
+        except FileNotFoundError:
+            raise SetupError("no /usr/bin/security: the Keychain is macOS-only") from None
+
+    def _find(self, account, *extra):
+        r = self._security(["find-generic-password", "-s", self.service, "-a", account, *extra])
+        if r.returncode == self.NOT_FOUND:
+            return None
+        if r.returncode != 0:
+            raise LinearError(f"could not read the Keychain item {self.service}/{account} (security exit {r.returncode})")
+        return r
+
+    def get(self, account):
+        r = self._find(account, "-w")
+        return (r.stdout.rstrip("\n") or None) if r else None
+
+    def get_comment(self, account):
+        r = self._find(account)
+        if r is None:
+            return None
+        m = re.search(r'"icmt"<blob>="([^"]*)"', r.stdout + r.stderr)
+        return m.group(1) if m else None
+
+    def set(self, account, secret, comment):
+        if not TOKEN_RE.fullmatch(secret) or not COMMENT_RE.fullmatch(comment):
+            raise LinearError("refusing to store a value with unexpected characters")
+        cmd = f'add-generic-password -U -s {self.service} -a {account} -j "{comment}" -w "{secret}"\n'
+        self._security(["-i"], stdin=cmd)
+        # security -i exits 0 even when a command inside it fails; read the item back.
+        if self.get(account) != secret or self.get_comment(account) != comment:
+            raise LinearError("could not write the access token to the Keychain")
+
+
+# --------------------------------------------------------------------------
+# HTTP
+
+
+SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
+
+
+def ssl_context(ca_file=SYSTEM_CA_FILE):
+    """Default TLS context, plus the macOS system CA bundle when Python has none.
+
+    python.org builds ship without CA certificates until "Install Certificates"
+    is run; without this every HTTPS call fails with CERTIFICATE_VERIFY_FAILED.
+    """
+    ctx = ssl.create_default_context()
+    if not ctx.get_ca_certs() and os.path.exists(ca_file):
+        ctx.load_verify_locations(ca_file)
+    return ctx
+
+
+_SSL = None
+
+
+def _json_or_none(raw):
+    try:
+        return json.loads(raw.decode() or "null")
+    except ValueError:
+        return None
+
+
+def http_post(url, body, headers):
+    """POST and return (status, parsed JSON or None).
+
+    Never raises on HTTP errors; network failures and timeouts come back as
+    status 0 so the caller can retry them like a 5xx.
+    """
+    return http_request("POST", url, body, headers)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the Authorization header to another URL; surface it as an error."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = None
+
+
+def http_request(method, url, body, headers, timeout=30):
+    global _SSL, _OPENER
+    if _OPENER is None:
+        _SSL = ssl_context()
+        _OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_SSL), _NoRedirect)
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, _json_or_none(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, _json_or_none(e.read())
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, {"networkError": str(getattr(e, "reason", e))}
+
+
+def _net_reason(data):
+    return (data or {}).get("networkError", "no details") if isinstance(data, dict) else "no details"
+
+
+def _rate_limited(status, data):
+    if status == 429:
+        return True
+    errors = (data or {}).get("errors") if isinstance(data, dict) else None
+    return any((e.get("extensions") or {}).get("code") == "RATELIMITED" for e in errors or [])
+
+
+def _transient(status, data, idempotent):
+    """Worth retrying? Writes retry only on rate limits: after a timeout or a 5xx the
+    server may already have created the comment or activity, and a retry would duplicate it."""
+    if _rate_limited(status, data):
+        return True
+    return idempotent and (status == 0 or status >= 500)
+
+
+# --------------------------------------------------------------------------
+# Client
+
+
+class Linear:
+    def __init__(self, keychain=None, post=http_post, now=time.time, sleep=time.sleep, expect_session=None):
+        self.kc = keychain or Keychain()
+        self.post = post
+        # Called with the issue's id before this client opens a session on it (expect_own_session).
+        self.expect_session = expect_session
+        self.now = now
+        self.sleep = sleep
+        self._token = None
+        self._viewer = None
+        self.token_source = None
+
+    # ---- auth
+
+    def _mint(self):
+        cid = self.kc.get("client-id")
+        secret = self.kc.get("client-secret")
+        if not cid or not secret:
+            raise SetupError(
+                "Keychain has no autopilot-linear client-id/client-secret. "
+                "Follow docs/setup.md (the owner stores them; never paste them in chat)."
+            )
+        body = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": cid,
+            "client_secret": secret,
+            "scope": SCOPES,
+        }).encode()
+        status, data = self._post(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded"}, idempotent=True)
+        if status == 0:
+            raise LinearError(f"network error: Linear token endpoint unreachable ({_net_reason(data)})")
+        if status != 200 or not isinstance(data, dict) or "access_token" not in data:
+            # Linear's error body has no secrets in it; keep only its message.
+            msg = (data or {}).get("error_description") or (data or {}).get("error") if isinstance(data, dict) else None
+            raise AuthError(f"token request failed (HTTP {status}): {msg or 'no details'}")
+        token = data["access_token"]
+        expires_at = int(self.now()) + int(data.get("expires_in") or DEFAULT_TOKEN_LIFETIME_S)
+        try:
+            self.kc.set("access-token", token, f"exp={expires_at}")
+        except LinearError as e:
+            # Still usable for this call; the next one mints again.
+            print(f"autopilot-linear: warning: token not cached: {e}", file=sys.stderr)
+        self.token_source = "minted"
+        return token
+
+    def token(self, force_new=False):
+        if self._token and not force_new:
+            return self._token
+        if not force_new:
+            cached = self.kc.get("access-token")
+            if cached:
+                # Only tokens this tool minted (they carry exp=) are trusted. A token
+                # stored by hand could be a personal key that posts as the owner.
+                m = re.fullmatch(r"exp=(\d+)", self.kc.get_comment("access-token") or "")
+                if m and int(m.group(1)) - self.now() > REFRESH_MARGIN_S:
+                    self._token, self.token_source = cached, "cached"
+                    return cached
+        self._token = self._mint()
+        return self._token
+
+    def gql(self, query, variables=None, _retried=False):
+        body = json.dumps({"query": query, "variables": variables or {}}).encode()
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.token()}"}
+        status, data = self._post(API_URL, body, headers, idempotent=not query.lstrip().startswith("mutation"))
+        if status == 0:
+            raise LinearError(f"network error: Linear API unreachable ({_net_reason(data)})")
+        errors = (data or {}).get("errors") if isinstance(data, dict) else None
+        auth_failed = status == 401 or any(
+            (e.get("extensions") or {}).get("code") == "AUTHENTICATION_ERROR" for e in errors or []
+        )
+        if auth_failed and not _retried:
+            self.token(force_new=True)
+            return self.gql(query, variables, _retried=True)
+        if auth_failed:
+            raise AuthError("Linear rejected the Autopilot token (re-minted once already)")
+        if errors:
+            raise LinearError("; ".join(e.get("message", "?") for e in errors))
+        if status != 200 or not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+            raise LinearError(f"Linear API HTTP {status} without data")
+        return data["data"]
+
+    def _post(self, url, body, headers, idempotent):
+        """POST with backoff on rate limits, and on network errors and 5xx for reads."""
+        for attempt in range(HTTP_RETRIES + 1):
+            status, data = self.post(url, body, headers)
+            if not _transient(status, data, idempotent) or attempt == HTTP_RETRIES:
+                return status, data
+            self.sleep(2 ** attempt * 2)
+        return status, data
+
+    # ---- reads
+
+    def viewer(self):
+        if self._viewer is None:
+            v = self.gql("query { viewer { id name displayName app } }")["viewer"]
+            if not v.get("app"):
+                raise AuthError("the token acts as a human user, not the Autopilot app; refusing to post")
+            self._viewer = v
+        return self._viewer
+
+    def users(self):
+        """The workspace's active people (ids for the gateway's ALLOWED_USER_IDS); no e-mail addresses."""
+        nodes = self.gql(USERS_QUERY)["users"]["nodes"]
+        return [{"id": u["id"], "name": u["name"], "displayName": u["displayName"]} for u in nodes if u.get("active")]
+
+    def queue(self, projects=None, team=None, exclude_projects=None):
+        """Open issues delegated to Autopilot, in the order a run should take them."""
+        me = self.viewer()["id"]
+        flt = {
+            "delegate": {"id": {"eq": me}},
+            "state": {"type": {"nin": ["completed", "canceled"]}},
+        }
+        project_flt = {}
+        if projects:
+            project_flt["in"] = list(projects)
+        if exclude_projects:
+            project_flt["nin"] = list(exclude_projects)
+        if project_flt:
+            flt["project"] = {"name": project_flt}
+        if team:
+            flt["team"] = {"key": {"eq": team}}
+        nodes, after = [], None
+        while True:
+            data = self.gql(QUEUE_QUERY, {"filter": flt, "after": after})["issues"]
+            nodes += data["nodes"]
+            if not data["pageInfo"]["hasNextPage"]:
+                break
+            after = data["pageInfo"]["endCursor"]
+        items = [summarize_issue(n, me) for n in nodes]
+        ready = sorted((i for i in items if i["eligible"]), key=queue_key)
+        held = [i for i in items if not i["eligible"]]
+        return {"viewer": self.viewer(), "count": len(ready), "issues": ready, "held": held}
+
+    def issue(self, ident):
+        data = self.gql(ISSUE_QUERY, {"id": ident})["issue"]
+        if data is None:
+            raise NotFoundError(f"issue {ident} not found (or Autopilot has no access to its team)")
+        me = self.viewer()["id"]
+        data["comments"] = sorted(data["comments"]["nodes"], key=lambda c: c["createdAt"])
+        data["labels"] = [l["name"] for l in data["labels"]["nodes"]]
+        data["openChildren"] = [c["identifier"] for c in data["children"]["nodes"]]
+        del data["children"]
+        data["deps"] = deps_of(data, data["openChildren"])
+        data.pop("relations", None)
+        data.pop("inverseRelations", None)
+        sessions = sorted((s for s in data.pop("agentSessions")["nodes"] if s["appUser"]["id"] == me),
+                          key=lambda s: s["createdAt"])
+        for s in sessions:
+            s["activities"] = sorted(s["activities"]["nodes"], key=lambda a: a["createdAt"])
+        # The latest session, and all of them: a mention opens a new session, and the
+        # thread that led to it (an earlier elicitation, the owner's answer) is in the older ones.
+        data["session"] = sessions[-1] if sessions else None
+        data["sessions"] = sessions
+        return data
+
+    # ---- writes
+
+    def ensure_session(self, ident):
+        """The current Autopilot session on the issue; a new one if none is open."""
+        self.viewer()  # refuses a token that acts as a human before any write
+        data = self.gql(SESSIONS_QUERY, {"id": ident})["issue"]
+        if data is None:
+            raise LinearError(f"issue {ident} not found")
+        me = self.viewer()["id"]
+        own = [s for s in data["agentSessions"]["nodes"] if s["appUser"]["id"] == me]
+        live = [s for s in own if s["status"] not in ("complete", "stale") and not s.get("dismissedAt")]
+        if live:
+            return max(live, key=lambda s: s["createdAt"])["id"]
+        if self.expect_session:
+            self.expect_session(data["id"])
+        res = self.gql(
+            "mutation($input: AgentSessionCreateOnIssue!) {"
+            " agentSessionCreateOnIssue(input: $input) { success agentSession { id } } }",
+            {"input": {"issueId": data["id"]}},
+        )["agentSessionCreateOnIssue"]
+        if not res["success"]:
+            raise LinearError("agentSessionCreateOnIssue failed")
+        return res["agentSession"]["id"]
+
+    def activity(self, ident, content, ephemeral=False, session_id=None):
+        if session_id:
+            self.viewer()  # refuses a token that acts as a human before any write
+        try:
+            sid = session_id or self.ensure_session(ident)
+        except LinearError as e:
+            if not sessions_disabled(e):
+                raise
+            return self._activity_fallback(ident, content)
+        inp = {"agentSessionId": sid, "content": content}
+        if ephemeral:
+            inp["ephemeral"] = True
+        res = self.gql(
+            "mutation($input: AgentActivityCreateInput!) {"
+            " agentActivityCreate(input: $input) { success agentActivity { id createdAt } } }",
+            {"input": inp},
+        )["agentActivityCreate"]
+        if not res["success"]:
+            raise LinearError("agentActivityCreate failed")
+        return {"sessionId": sid, **res["agentActivity"]}
+
+    def _activity_fallback(self, ident, content):
+        kind = content["type"]
+        if kind not in FALLBACK_PREFIX:
+            # Progress notes (thought, action) would only be noise as comments.
+            return {"skipped": True, "reason": "agent sessions disabled for this app", "type": kind}
+        c = self.comment(ident, FALLBACK_PREFIX[kind] + content["body"])
+        return {"fallback": "comment", "type": kind, "comment": c}
+
+    def comment(self, ident, body):
+        self.viewer()  # refuses a token that acts as a human before any write
+        res = self.gql(
+            "mutation($input: CommentCreateInput!) {"
+            " commentCreate(input: $input) { success comment { id url user { name app } } } }",
+            {"input": {"issueId": ident, "body": body}},
+        )["commentCreate"]
+        if not res["success"]:
+            raise LinearError("commentCreate failed")
+        return res["comment"]
+
+    def ask_owner(self, ident, body, fallback=None):
+        """A top-level comment that @mentions the issue's creator (else `fallback`, a human's name or
+        email), so Linear notifies them. Used when only the owner can unblock the issue: the agent-session
+        elicitation alone mentions no one and Linear folds it."""
+        data = self.gql(CREATOR_QUERY, {"id": ident})["issue"]
+        if data is None:
+            raise LinearError(f"issue {ident} not found")
+        who = data.get("creator")
+        if not who or who.get("app") or not who.get("url"):
+            if not fallback:
+                raise LinearError(f"{ident} has no human creator; pass --fallback <owner>")
+            users = [u for u in self.gql(USER_QUERY, {"q": fallback})["users"]["nodes"] if not u["app"]]
+            if len(users) != 1:
+                raise LinearError(f"fallback '{fallback}' matches {len(users)} people, need exactly 1")
+            who = users[0]
+        text = f"{who['url']} **Autopilot needs you on {data['identifier']}.**\n\n{body.strip()}\n"
+        out = self.comment(ident, text)
+        return {**out, "mentioned": who["name"]}
+
+    def set_state(self, ident, wanted, settle=0):
+        """Set the issue's state. With `settle` seconds, wait that long, read it back and set it once
+        more if something else changed it meanwhile: Linear's own PR automations (merge → Done) land
+        a few seconds after a merge and would otherwise overwrite Autopilot's status.
+        A canceled state is left alone: that's a person's decision, not an automation."""
+        self.viewer()  # refuses a token that acts as a human before any write
+        data = self.gql(STATES_QUERY, {"id": ident})["issue"]
+        if data is None:
+            raise LinearError(f"issue {ident} not found")
+        states = data["team"]["states"]["nodes"]
+        state = pick_state(states, wanted)
+        if state is None:
+            names = ", ".join(sorted(s["name"] for s in states))
+            raise LinearError(f"no workflow state '{wanted}' in team {data['team']['key']} (have: {names})")
+        out = self._update_state(data["id"], state["id"])
+        if settle <= 0:
+            return out
+        self.sleep(settle)
+        now = (self.gql(STATES_QUERY, {"id": ident})["issue"] or {}).get("state") or {}
+        if now.get("id") == state["id"] or now.get("type") == "canceled":
+            return {**out, "reasserted": False, **({"now": now.get("name")} if now.get("id") != state["id"] else {})}
+        return {**self._update_state(data["id"], state["id"]), "reasserted": {"from": now.get("name")}}
+
+    def _update_state(self, issue_id, state_id):
+        res = self.gql(
+            "mutation($id: String!, $input: IssueUpdateInput!) {"
+            " issueUpdate(id: $id, input: $input) { success issue { identifier state { name type } } } }",
+            {"id": issue_id, "input": {"stateId": state_id}},
+        )["issueUpdate"]
+        if not res["success"]:
+            raise LinearError("issueUpdate failed")
+        return res["issue"]
+
+    def automations(self, team_keys):
+        """Linear's PR automations (on PR start / review / merge, move the issue to a state) per
+        team. Any of them fights Autopilot, which sets every status itself."""
+        teams = []
+        for key in team_keys:
+            nodes = self.gql(AUTOMATIONS_QUERY, {"key": key})["teams"]["nodes"]
+            if not nodes:
+                raise LinearError(f"no team with key {key}")
+            on = [{"event": a["event"], "state": a["state"]["name"],
+                   "branch": (a.get("targetBranch") or {}).get("branchPattern")}
+                  for a in nodes[0]["gitAutomationStates"]["nodes"] if a.get("state")]
+            teams.append({"team": key, "automations": on})
+        return {"fights": any(t["automations"] for t in teams), "teams": teams}
+
+    def create_issue(self, team_key, project, state, title, description, parent=None, assignee=None):
+        """File a follow-up issue as Autopilot. It is never delegated to Autopilot.
+
+        `assignee` (a human's name or email) makes Linear notify them, e.g. for a sign-in notice."""
+        self.viewer()
+        data = self.gql(CREATE_CONTEXT_QUERY, {"key": team_key, "project": project})
+        teams = data["teams"]["nodes"]
+        if not teams:
+            raise LinearError(f"no team with key {team_key}")
+        team = teams[0]
+        projects = data["projects"]["nodes"]
+        if not projects:
+            raise LinearError(f"no project named {project} in team {team_key}")
+        st = pick_state(team["states"]["nodes"], state)
+        if st is None:
+            raise LinearError(f"no workflow state '{state}' in team {team_key}")
+        inp = {"teamId": team["id"], "projectId": projects[0]["id"], "stateId": st["id"],
+               "title": title, "description": description}
+        if parent:
+            inp["parentId"] = parent
+        if assignee:
+            users = [u for u in self.gql(USER_QUERY, {"q": assignee})["users"]["nodes"] if not u["app"]]
+            if len(users) != 1:
+                raise LinearError(f"assignee '{assignee}' matches {len(users)} people, need exactly 1")
+            inp["assigneeId"] = users[0]["id"]
+        res = self.gql(
+            "mutation($input: IssueCreateInput!) {"
+            " issueCreate(input: $input) { success issue { identifier url } } }",
+            {"input": inp},
+        )["issueCreate"]
+        if not res["success"]:
+            raise LinearError("issueCreate failed")
+        return res["issue"]
+
+    def add_link(self, ident, label, url, session_id=None):
+        if session_id:
+            self.viewer()
+        try:
+            sid = session_id or self.ensure_session(ident)
+        except LinearError as e:
+            if not sessions_disabled(e):
+                raise
+            return {"skipped": True, "reason": "agent sessions disabled for this app", "label": label, "url": url}
+        res = self.gql(
+            "mutation($id: String!, $input: AgentSessionUpdateInput!) {"
+            " agentSessionUpdate(id: $id, input: $input) { success } }",
+            {"id": sid, "input": {"addedExternalUrls": [{"label": label, "url": url}]}},
+        )["agentSessionUpdate"]
+        if not res["success"]:
+            raise LinearError("agentSessionUpdate failed")
+        return {"sessionId": sid, "label": label, "url": url}
+
+
+# --------------------------------------------------------------------------
+# Gateway (phase 2): jobs from Linear's agent-session webhooks
+
+
+GATEWAY_URL_RE = re.compile(r"https://[A-Za-z0-9.-]+/?")
+LOCAL_URL_RE = re.compile(r"http://(127\.0\.0\.1|localhost)(:\d+)?/?")
+CURRENT_JOB_MAX_AGE_S = 6 * 3600  # same as the stale run lock
+JOB_ID_RE = re.compile(r"[0-9a-f-]{36}")
+# Cloudflare's bot check answers 403 to Python's default "Python-urllib/x.y" user agent
+# before the request reaches the Worker, so the runner names itself.
+GATEWAY_USER_AGENT = "autopilot-runner/0.5.0"
+CURRENT_JOBS_DIR = "current-jobs"  # <ISSUE>.json: the job a run claimed for that issue
+
+
+class Gateway:
+    """The runner's side of the gateway API. URL and token come from the Keychain
+    (service autopilot-gateway); the token is sent only in the Authorization header."""
+
+    def __init__(self, keychain=None, request=http_request, sleep=time.sleep):
+        self.kc = keychain or Keychain(service=GATEWAY_SERVICE)
+        self.request = request
+        self.sleep = sleep
+        self._conf = None
+
+    def _config(self):
+        if self._conf is None:
+            # The env override is for `wrangler dev` only: the Keychain token must never be
+            # sent to a host the environment names.
+            override = os.environ.get("AUTOPILOT_GATEWAY_URL")
+            if override and not LOCAL_URL_RE.fullmatch(override):
+                raise SetupError("AUTOPILOT_GATEWAY_URL may only point at http://localhost (wrangler dev)")
+            url = override or self.kc.get("url")
+            token = self.kc.get("token") if url else None
+            self._conf = (url, token)
+        return self._conf
+
+    def enabled(self):
+        """Set up (a URL is stored) and not switched off with AUTOPILOT_GATEWAY=off."""
+        if os.environ.get("AUTOPILOT_GATEWAY", "").lower() == "off":
+            return False
+        return bool(self._config()[0])
+
+    def _call(self, method, path, body=None, quick=False):
+        url, token = self._config()
+        if not url:
+            raise SetupError("Keychain has no autopilot-gateway url. Follow docs/gateway.md.")
+        if not (GATEWAY_URL_RE.fullmatch(url) or LOCAL_URL_RE.fullmatch(url) and os.environ.get("AUTOPILOT_GATEWAY_URL")):
+            raise SetupError("the autopilot-gateway url must be https://host")
+        if not token:
+            raise SetupError("Keychain has no autopilot-gateway token. Follow docs/gateway.md (the owner stores it).")
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": GATEWAY_USER_AGENT}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        # Not retried: ack (a repeat would count as a second attempt). done/blocked are
+        # idempotent on the gateway, so they are, like reads.
+        # `quick`: once, briefly, for calls made inside a hook's timeout.
+        tries = 1 if path.endswith("/ack") or quick else HTTP_RETRIES + 1
+        for attempt in range(tries):
+            if quick:
+                status, out = self.request(method, url.rstrip("/") + path, data, headers, timeout=EXPECT_TIMEOUT_S)
+            else:
+                status, out = self.request(method, url.rstrip("/") + path, data, headers)
+            if not (status == 0 or status >= 500) or attempt == tries - 1:
+                break
+            self.sleep(2 ** attempt * 2)
+        if status == 0:
+            raise GatewayDown(f"network error: gateway unreachable ({_net_reason(out)})")
+        if status >= 500:
+            raise GatewayDown(f"gateway {method} {path} failed (HTTP {status})")
+        if status == 401:
+            raise AuthError("the gateway rejected the runner token (Keychain autopilot-gateway/token vs the Worker's GATEWAY_TOKEN)")
+        if status != 200 or not isinstance(out, dict):
+            msg = out.get("error") if isinstance(out, dict) else None
+            raise LinearError(f"gateway {method} {path} failed (HTTP {status}): {msg or 'no details'}")
+        return out
+
+    def next(self):
+        return self._call("GET", "/jobs/next")
+
+    def update(self, job_id, action, note=None):
+        check_job_id(job_id)
+        body = {"note": note} if note else {}
+        return self._call("POST", f"/jobs/{job_id}/{action}", body)["job"]
+
+    def get(self, job_id):
+        check_job_id(job_id)
+        return self._call("GET", f"/jobs/{job_id}")["job"]
+
+    def expect_session(self, issue_id):
+        """Autopilot is about to open a session on this issue (its Linear id) itself. Once, briefly:
+        the stream hook calls it and must stay within its timeout."""
+        return self._call("POST", "/sessions/expect", {"issueId": issue_id}, quick=True)
+
+
+def expect_own_session(gateway):
+    """For Linear(expect_session=...): a session Autopilot opens has no creator, so the gateway
+    can't tell it from someone else's and answers it "I only take work from my owner", which
+    closes it. Told first, it leaves it alone. Best effort: without the gateway, nothing answers."""
+    def expect(issue_id):
+        try:
+            if gateway.enabled():
+                gateway.expect_session(issue_id)
+        except (LinearError, SetupError) as e:
+            print(f"autopilot-linear: warning: {e}; the gateway may answer the new session", file=sys.stderr)
+    return expect
+
+
+def check_job_id(job_id):
+    if not JOB_ID_RE.fullmatch(job_id or ""):
+        raise LinearError(f"not a job id: {job_id!r}")
+
+
+def current_job_path(ident):
+    """One file per issue (runs work several issues in parallel, never one issue twice)."""
+    return os.path.join(STATE_DIR, CURRENT_JOBS_DIR, f"{(ident or '').upper()}.json")
+
+
+def _current_job_files():
+    d = os.path.join(STATE_DIR, CURRENT_JOBS_DIR)
+    try:
+        return [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".json")]
+    except OSError:
+        return []
+
+
+def read_current_job(ident, now=time.time):
+    """The job a run claimed for this issue, unless it is older than a stale run (that run died)."""
+    path = current_job_path(ident)
+    try:
+        if now() - os.stat(path).st_mtime > CURRENT_JOB_MAX_AGE_S:
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_job_file(rec):
+    path = current_job_path(rec["identifier"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(path + ".tmp", path)
+
+
+def write_current_job(job):
+    """Remember the claimed job. A second job of the same issue (the owner delegated or wrote
+    twice) doesn't take over: the first one stays the run's session, so its progress isn't split,
+    and the others are kept in `also`. Returns True when this job's session became one of the `also`
+    (a job in the run's own session, e.g. a note the gateway put there, needs no pointer)."""
+    cur = read_current_job(job.get("identifier"))
+    if cur and cur.get("id") != job["id"]:
+        also = [a for a in cur.get("also", []) if a["id"] != job["id"]]
+        secondary = cur.get("sessionId") != job["sessionId"]
+        if secondary:
+            also.append({"id": job["id"], "sessionId": job["sessionId"]})
+        cur["also"] = also
+        rec = cur
+    else:
+        rec, secondary = {"id": job["id"], "sessionId": job["sessionId"], "identifier": job["identifier"]}, False
+    _write_job_file(rec)
+    return secondary
+
+
+def clear_current_job(job_id):
+    """The run is done with this job: forget it wherever it is (main job or one of `also`)."""
+    for path in _current_job_files():
+        try:
+            with open(path, encoding="utf-8") as f:
+                cur = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if cur.get("id") == job_id:
+            os.remove(path)
+        elif any(a["id"] == job_id for a in cur.get("also", [])):
+            cur["also"] = [a for a in cur["also"] if a["id"] != job_id]
+            _write_job_file(cur)
+
+
+def mirror_sessions(ident):
+    """The other sessions of the claimed issue, which get the run's final word too."""
+    cur = read_current_job(ident)
+    return [a["sessionId"] for a in cur.get("also", [])] if cur else []
+
+
+# Activities that end or pause a session: every open session of the issue gets them.
+MIRRORED_TYPES = ("response", "elicitation", "error")
+
+
+def session_for(args):
+    """--session, else the claimed job's session when the issue matches, else None
+    (the helper then finds or opens an Autopilot session on the issue)."""
+    if getattr(args, "session", None):
+        return args.session
+    cur = read_current_job(args.id)
+    return cur.get("sessionId") if cur else None
+
+
+def _held_issues():
+    """Issues a live run holds a fresh lock on (bin/autopilot-inflight, next to this file)."""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "autopilot-inflight")
+    loader = importlib.machinery.SourceFileLoader("autopilot_inflight", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.locked_issues()
+
+
+def gateway_queue(gw, lin, count=False, next_=False, exclude_projects=None, list_=False, queued_only=False, held=None):
+    data = gw.next()
+    if count:
+        if queued_only:
+            # Parallel runs: jobs no run has taken yet, plus "running" jobs no live run holds (their
+            # run died: a usage limit, a crash, a stop). A live run locks the issue before it claims
+            # the job and keeps the lock fresh, so this never counts a job that is being worked.
+            jobs = data.get("jobs") or []
+            if not any(j.get("status") == "running" for j in jobs):
+                return sum(1 for j in jobs if j.get("status") == "queued")
+            held = _held_issues() if held is None else held
+            return sum(1 for j in jobs if j.get("status") == "queued"
+                       or (j.get("status") == "running" and j.get("identifier") not in held))
+        return data["pending"]
+    jobs = data.get("jobs") or ([data["job"]] if data.get("job") else [])
+    if not (next_ or list_):
+        return {"source": "gateway", "pending": data["pending"], "jobs": jobs}
+    skip = set(exclude_projects or ())
+    items = []
+    for job in jobs:
+        try:
+            issue = lin.issue(job["issueId"] or job["identifier"])
+        except NotFoundError:
+            # Deleted, or its team taken away from Autopilot: don't let it block the queue.
+            gw.update(job["id"], "blocked", "issue not found")
+            continue
+        item = summarize_job(job, issue)
+        if item["project"] in skip:
+            continue
+        if next_:
+            return item
+        items.append(item)
+    # --list: every takeable job in the gateway's order, resolved like --next, so the
+    # orchestrator can apply its pick order without losing the project skip.
+    return {"source": "gateway", "pending": data["pending"], "items": items} if list_ else None
+
+
+# --------------------------------------------------------------------------
+# Pure helpers (unit-tested)
+
+
+DONE_TYPES = ("completed", "canceled")
+
+
+def deps_of(n, open_children):
+    """Open issues this one depends on or is tied to, from Linear's relations: what a run must
+    not work on in parallel with it (owner's rule, 2026-10-20)."""
+    def is_open(i):
+        return bool(i) and (i.get("state") or {}).get("type") not in DONE_TYPES
+    rel = (n.get("relations") or {}).get("nodes") or []
+    inv = (n.get("inverseRelations") or {}).get("nodes") or []
+    parent = n.get("parent")
+    return {
+        "blockedBy": sorted(r["issue"]["identifier"] for r in inv if r.get("type") == "blocks" and is_open(r.get("issue"))),
+        "blocks": sorted(r["relatedIssue"]["identifier"] for r in rel if r.get("type") == "blocks" and is_open(r.get("relatedIssue"))),
+        "parent": parent["identifier"] if is_open(parent) else None,
+        "children": list(open_children),
+    }
+
+
+def summarize_job(job, issue):
+    """A gateway job in the shape of a queue item, plus the job itself.
+
+    No owner-wait hold here: the gateway only queues on a delegation, a mention or a
+    reply in an Autopilot session, so a job always means the owner wants a run."""
+    human = [c["createdAt"] for c in issue["comments"] if c.get("user") and not c["user"]["app"]]
+    reason = "open sub-issues: " + ", ".join(issue["openChildren"]) if issue["openChildren"] else None
+    return {
+        "identifier": issue["identifier"],
+        "title": issue["title"],
+        "url": issue["url"],
+        "priority": issue["priority"],
+        "createdAt": issue["createdAt"],
+        "state": issue["state"]["name"],
+        "stateType": issue["state"]["type"],
+        "team": issue["team"]["key"],
+        "project": (issue.get("project") or {}).get("name"),
+        "labels": issue["labels"],
+        "resume": job["status"] == "running" or issue["state"]["type"] == "started",
+        "session": {"id": job["sessionId"]},
+        "lastHumanAt": max(human) if human else None,
+        "eligible": reason is None,
+        "heldBecause": reason,
+        "deps": issue.get("deps") or {"blockedBy": [], "blocks": [], "parent": None, "children": issue["openChildren"]},
+        "job": {k: job.get(k) for k in ("id", "kind", "status", "attempts", "stopRequested", "sessionId", "commentId", "prompt", "createdAt", "source", "github")},
+    }
+
+
+
+def summarize_issue(n, me):
+    """Flatten a queue node and decide whether a run may take it now."""
+    sessions = [s for s in n["agentSessions"]["nodes"] if s["appUser"]["id"] == me]
+    session = max(sessions, key=lambda s: s["createdAt"]) if sessions else None
+    comments = n["comments"]["nodes"]
+    human_times = [c["createdAt"] for c in comments if c.get("user") and not c["user"]["app"]]
+    last_human = max(human_times) if human_times else None
+    # Hold on the newest *marker* comment, so later progress comments don't release it.
+    asks = [c["createdAt"] for c in comments
+            if (c.get("user") or {}).get("id") == me and (c.get("body") or "").startswith(HOLD_MARKERS)]
+    last_ask = max(asks) if asks else None
+    open_children = [c["identifier"] for c in n["children"]["nodes"]]
+    session_waiting = bool(
+        session
+        and session["status"] in WAITING_STATUSES
+        and not (last_human and last_human > session["updatedAt"])
+    )
+    comment_waiting = bool(last_ask and not (last_human and last_human > last_ask))
+    waiting = session_waiting or comment_waiting
+    reason = None
+    if open_children:
+        reason = "open sub-issues: " + ", ".join(open_children)
+    elif waiting:
+        why = f"session {session['status']}" if session_waiting else "asked in a comment"
+        reason = f"waiting for the owner ({why}, no reply since)"
+    return {
+        "identifier": n["identifier"],
+        "title": n["title"],
+        "url": n["url"],
+        "priority": n["priority"],
+        "createdAt": n["createdAt"],
+        "state": n["state"]["name"],
+        "stateType": n["state"]["type"],
+        "team": n["team"]["key"],
+        "project": (n.get("project") or {}).get("name"),
+        "labels": [l["name"] for l in n["labels"]["nodes"]],
+        "resume": n["state"]["type"] == "started",
+        "session": {"id": session["id"], "status": session["status"]} if session else None,
+        "lastHumanAt": last_human,
+        "eligible": reason is None,
+        "heldBecause": reason,
+        "deps": deps_of(n, open_children),
+    }
+
+
+def queue_key(i):
+    # Resume interrupted work first, then priority, then oldest.
+    return (0 if i["resume"] else 1, PRIORITY_RANK.get(i["priority"], 4), i["createdAt"])
+
+
+def pick_state(states, wanted):
+    """Match a workflow state by name (case-insensitive), else by type."""
+    w = wanted.strip().lower()
+    for s in states:
+        if s["name"].lower() == w:
+            return s
+    typed = [s for s in states if s["type"] == w]
+    return min(typed, key=lambda s: s.get("position", 0)) if typed else None
+
+
+def activity_content(args):
+    if args.type == "action":
+        if not args.action or args.parameter is None:
+            raise LinearError("--type action needs --action and --parameter")
+        c = {"type": "action", "action": args.action, "parameter": args.parameter}
+        if args.result is not None:
+            c["result"] = args.result
+        return c
+    body = read_body(args)
+    if not body:
+        raise LinearError(f"--type {args.type} needs --body or --body-file")
+    return {"type": args.type, "body": body}
+
+
+def read_body(args):
+    if getattr(args, "body_file", None):
+        if args.body_file == "-":
+            return sys.stdin.read()
+        with open(args.body_file, encoding="utf-8") as f:
+            return f.read()
+    return getattr(args, "body", None)
+
+
+# --------------------------------------------------------------------------
+# GraphQL documents
+
+QUEUE_QUERY = """
+query Queue($filter: IssueFilter, $after: String) {
+  issues(filter: $filter, first: 50, after: $after) {
+    nodes {
+      id identifier title url priority createdAt
+      state { name type }
+      team { key }
+      project { name }
+      labels { nodes { name } }
+      children(filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { identifier } }
+      parent { identifier state { type } }
+      relations(first: 50) { nodes { type relatedIssue { identifier state { type } } } }
+      inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
+      agentSessions(first: 20, orderBy: createdAt) { nodes { id status createdAt updatedAt appUser { id } } }
+      comments(first: 100, orderBy: createdAt) { nodes { createdAt body user { id app } } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+ISSUE_QUERY = """
+query Issue($id: String!) {
+  issue(id: $id) {
+    id identifier title description url priority createdAt
+    state { name type }
+    team { key }
+    project { name }
+    parent { identifier title state { type } }
+    assignee { name }
+    delegate { name }
+    creator { name displayName url app }
+    labels { nodes { name } }
+    children(filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { identifier } }
+    relations(first: 50) { nodes { type relatedIssue { identifier state { type } } } }
+    inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
+    comments(first: 100) { nodes { id createdAt body parent { id } user { name app } } }
+    agentSessions(first: 20) {
+      nodes {
+        id status createdAt updatedAt appUser { id }
+        activities(first: 50) {
+          nodes {
+            createdAt
+            content {
+              ... on AgentActivityThoughtContent { type body }
+              ... on AgentActivityElicitationContent { type body }
+              ... on AgentActivityResponseContent { type body }
+              ... on AgentActivityErrorContent { type body }
+              ... on AgentActivityPromptContent { type body }
+              ... on AgentActivityActionContent { type action parameter result }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+SESSIONS_QUERY = """
+query Sessions($id: String!) {
+  issue(id: $id) {
+    id
+    agentSessions(first: 20) { nodes { id status createdAt dismissedAt appUser { id } } }
+  }
+}
+"""
+
+CREATE_CONTEXT_QUERY = """
+query CreateContext($key: String!, $project: String!) {
+  teams(filter: { key: { eq: $key } }) { nodes { id states { nodes { id name type position } } } }
+  projects(filter: { name: { eq: $project }, accessibleTeams: { some: { key: { eq: $key } } } }) { nodes { id } }
+}
+"""
+
+USERS_QUERY = """
+query { users(first: 250) { nodes { id name displayName active } } }
+"""
+
+USER_QUERY = """
+query User($q: String!) {
+  users(filter: { or: [{ email: { eqIgnoreCase: $q } }, { name: { eqIgnoreCase: $q } }, { displayName: { eqIgnoreCase: $q } }] }) {
+    nodes { id app name url }
+  }
+}
+"""
+
+CREATOR_QUERY = """
+query IssueCreator($id: String!) {
+  issue(id: $id) { identifier creator { name url app } }
+}
+"""
+
+STATES_QUERY = """
+query States($id: String!) {
+  issue(id: $id) {
+    id
+    state { id name type }
+    team { key states { nodes { id name type position } } }
+  }
+}
+"""
+
+AUTOMATIONS_QUERY = """
+query Automations($key: String!) {
+  teams(filter: { key: { eq: $key } }, first: 1) {
+    nodes { key gitAutomationStates(first: 20) { nodes { event state { name } targetBranch { branchPattern } } } }
+  }
+}
+"""
+
+
+# --------------------------------------------------------------------------
+# CLI
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="autopilot-linear", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("auth-check", help="verify the Keychain setup and who the token acts as")
+    sub.add_parser("whoami", help="the Linear user the token acts as")
+    sub.add_parser("users", help="the workspace's active people and their ids (for ALLOWED_USER_IDS)")
+
+    q = sub.add_parser("queue", help="issues delegated to Autopilot, in run order")
+    q.add_argument("--project", action="append", help="limit to a project name (repeatable)")
+    q.add_argument("--team", help="limit to a team key, e.g. ENG")
+    q.add_argument("--exclude-project", action="append", help="skip a project name (repeatable)")
+    q.add_argument("--count", action="store_true", help="print only the number of takeable issues")
+    q.add_argument("--next", action="store_true", help="print only the first takeable issue (or null)")
+    q.add_argument("--queued", action="store_true",
+                   help="with --count: only jobs no run has taken (not the running ones)")
+    q.add_argument("--list", action="store_true",
+                   help="gateway: every takeable job resolved like --next, in order ({items: [...]})")
+    q.add_argument("--source", choices=["auto", "gateway", "linear"], default="auto",
+                   help="auto: gateway jobs when the gateway is set up, else poll Linear")
+
+    i = sub.add_parser("issue", help="an issue with comments and the latest Autopilot session")
+    i.add_argument("id")
+
+    c = sub.add_parser("comment", help="post a comment as Autopilot")
+    c.add_argument("id")
+    c.add_argument("--body")
+    c.add_argument("--body-file", help="path, or - for stdin")
+
+    o = sub.add_parser("ask-owner", help="top-level comment that @mentions the issue's creator (Linear notifies them)")
+    o.add_argument("id")
+    o.add_argument("--body")
+    o.add_argument("--body-file", help="path, or - for stdin")
+    o.add_argument("--fallback", help="a human's name or email when the creator is an app or unknown")
+
+    a = sub.add_parser("activity", help="post an agent activity as Autopilot")
+    a.add_argument("id")
+    a.add_argument("--type", required=True, choices=["thought", "action", "elicitation", "response", "error"])
+    a.add_argument("--body")
+    a.add_argument("--body-file", help="path, or - for stdin")
+    a.add_argument("--action")
+    a.add_argument("--parameter")
+    a.add_argument("--result")
+    a.add_argument("--ephemeral", action="store_true", help="thought/action only")
+    a.add_argument("--session", help="agent session id (default: the claimed job's, else the issue's live one)")
+
+    s = sub.add_parser("state", help="set the issue's workflow state (name or type)")
+    s.add_argument("id")
+    s.add_argument("state")
+    s.add_argument("--settle", type=int, default=0,
+                   help="seconds to wait, then set it again if something else changed it (max 60)")
+
+    au = sub.add_parser("automations", help="Linear PR automations that would fight Autopilot's statuses")
+    au.add_argument("--team", action="append", required=True, help="team key, e.g. ENG (repeatable)")
+
+    n = sub.add_parser("create", help="file a follow-up issue as Autopilot (never delegated to it)")
+    n.add_argument("--team", required=True, help="team key, e.g. ENG")
+    n.add_argument("--project", required=True)
+    n.add_argument("--state", default="Backlog")
+    n.add_argument("--title", required=True)
+    n.add_argument("--body")
+    n.add_argument("--body-file", help="path, or - for stdin")
+    n.add_argument("--parent", help="parent issue ID")
+    n.add_argument("--assignee", help="a human's Linear name or email; Linear notifies them")
+
+    l = sub.add_parser("link", help="add an external link (e.g. the PR) to the Autopilot session")
+    l.add_argument("id")
+    l.add_argument("--label", required=True)
+    l.add_argument("--url", required=True)
+    l.add_argument("--session", help="agent session id (default: the claimed job's, else the issue's live one)")
+
+    j = sub.add_parser("jobs", help="gateway jobs: next, or ack/done/blocked a job")
+    j.add_argument("action", choices=["next", "get", "ack", "done", "blocked"])
+    j.add_argument("job_id", nargs="?")
+    j.add_argument("--note", help="done/blocked: one line, e.g. the PR URL or why it stopped")
+    return p
+
+
+def run(argv, client=None, gateway=None):
+    args = build_parser().parse_args(argv)
+    gw = gateway or Gateway()  # reads the Keychain only when a command needs it
+    lin = client or Linear(expect_session=expect_own_session(gw))
+    if args.cmd == "auth-check":
+        v = lin.viewer()
+        return {"ok": True, "viewer": v, "tokenSource": lin.token_source}
+    if args.cmd == "whoami":
+        return lin.viewer()
+    if args.cmd == "users":
+        return lin.users()
+    if args.cmd == "queue":
+        use_gw = args.source == "gateway" or (args.source == "auto" and not (args.project or args.team) and gw.enabled())
+        if use_gw:
+            try:
+                return gateway_queue(gw, lin, args.count, args.next, args.exclude_project, args.list, args.queued)
+            except GatewayDown as e:
+                if args.source == "gateway":
+                    raise
+                # Delegations still work by polling; mentions wait until the gateway is back.
+                print(f"autopilot-linear: warning: {e}; polling Linear instead", file=sys.stderr)
+        q = lin.queue(args.project, args.team, args.exclude_project)
+        if args.count:
+            return q["count"]
+        if args.next:
+            return q["issues"][0] if q["issues"] else None
+        return q
+    if args.cmd == "issue":
+        return lin.issue(args.id)
+    if args.cmd == "comment":
+        body = read_body(args)
+        if not body:
+            raise LinearError("comment needs --body or --body-file")
+        return lin.comment(args.id, body)
+    if args.cmd == "ask-owner":
+        body = read_body(args)
+        if not body:
+            raise LinearError("ask-owner needs --body or --body-file")
+        return lin.ask_owner(args.id, body, args.fallback)
+    if args.cmd == "activity":
+        if args.ephemeral and args.type not in ("thought", "action"):
+            raise LinearError("only thought and action activities can be ephemeral")
+        content = activity_content(args)
+        out = lin.activity(args.id, content, args.ephemeral, session_for(args))
+        if not getattr(args, "session", None) and content["type"] in MIRRORED_TYPES:
+            mirrored = []
+            for sid in mirror_sessions(args.id):
+                try:
+                    lin.activity(args.id, content, False, sid)
+                    mirrored.append(sid)
+                except LinearError as e:  # the main session has it; don't fail the run over a copy
+                    print(f"autopilot-linear: warning: mirroring to session {sid} failed: {e}", file=sys.stderr)
+            if mirrored and isinstance(out, dict):
+                out = {**out, "mirroredTo": mirrored}
+        return out
+    if args.cmd == "state":
+        return lin.set_state(args.id, args.state, max(0, min(args.settle, 60)))
+    if args.cmd == "automations":
+        return lin.automations(args.team)
+    if args.cmd == "create":
+        return lin.create_issue(args.team, args.project, args.state, args.title, read_body(args) or "", args.parent, args.assignee)
+    if args.cmd == "link":
+        return lin.add_link(args.id, args.label, args.url, session_for(args))
+    if args.cmd == "jobs":
+        if args.action == "next":
+            return gw.next()
+        if not args.job_id:
+            raise LinearError(f"jobs {args.action} needs a job id")
+        if args.action == "get":
+            return gw.get(args.job_id)
+        try:
+            job = gw.update(args.job_id, args.action, args.note)
+        except LinearError:
+            if args.action != "ack":
+                clear_current_job(args.job_id)  # finished or not, this run is done with it
+            raise
+        if args.action == "ack":
+            if write_current_job(job):
+                # The owner started a second session on this issue: say where the work is. Only a
+                # note: the job is already acked, so a failure here must not fail the ack.
+                try:
+                    lin.activity(job["identifier"], {"type": "thought", "body": (
+                        "Picked up together with the earlier session on this issue. Progress is posted there; "
+                        "the result comes here too.")}, False, job["sessionId"])
+                except LinearError as e:
+                    print(f"autopilot-linear: warning: pointer to session {job['sessionId']} failed: {e}", file=sys.stderr)
+        else:
+            clear_current_job(job["id"])
+        return job
+    raise LinearError(f"unknown command {args.cmd}")
+
+
+def main(argv=None):
+    try:
+        out = run(sys.argv[1:] if argv is None else argv)
+    except SetupError as e:
+        print(f"autopilot-linear: setup needed: {e}", file=sys.stderr)
+        return 2
+    except LinearError as e:
+        print(f"autopilot-linear: {e}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"autopilot-linear: network error: {e.reason}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

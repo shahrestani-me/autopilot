@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""autopilot-fallback: Autopilot runs on OpenRouter models when Claude can't run them ("API mode").
+
+Two ways in:
+  - the Claude subscription hit a usage limit, the 5-hour one or the weekly one: the StopFailure hook
+    (bin/autopilot-runstate) calls `limited` and `start`. It ends by itself when Claude works again:
+    the next Claude session that runs a Bash command clears the flag (LIMIT_MAX_H is a backstop);
+  - the owner turns API mode on (`mode on`, /autopilot:api-mode on). The scheduled tasks then skip
+    their Claude run and call `start` instead (docs/setup.md, step 1).
+
+While either holds, a detached supervisor works the queue one run at a time: a headless `claude -p`
+running the orchestrator skill (Agent: autopilot-fallback) on OpenRouter, with a model per role:
+  orchestrator  the run's main model                    (default openai/gpt-5.6-terra)
+  reviewer      every Claude alias a subagent can name  (default openai/gpt-5.6-sol)
+  coder         bin/autopilot-coder for the code itself (default openai/gpt-5.6-terra)
+Each run is stopped when its spend passes usd_per_ticket, and no run starts once usd_per_day is
+spent. Spend is measured as the OpenRouter key's usage before and after, and booked in Autopilot's
+own ledger: the caps come from Autopilot's config, not from the key's limit on OpenRouter.
+
+A launchd tick (`install-tick`, every TICK_S) calls `tick`, which starts the supervisor whenever
+API mode is active and none runs: API mode carries on through a weekly limit, and without any
+Claude session or hook having to fire.
+
+Settings: ~/.config/autopilot/openrouter.json (bin/autopilot-coder DEFAULTS and BOUNDS; `config set`).
+Ledger: $STATE/openrouter-spend.json. State: $AUTOPILOT_STATE_DIR (default ~/.local/state/autopilot):
+api-mode, claude-limited, fallback.lock (the supervisor, with its pid), fallback.log, fallback-tick.log.
+
+  autopilot-fallback status                  {"active": ..., "api_mode": ..., "claude_limited": ..., "running": ..., ...}
+  autopilot-fallback mode on|off             force API mode, or end it (a limit still counts)
+  autopilot-fallback limited                 record that Claude hit its usage limit (the hook)
+  autopilot-fallback clear-limit             Claude works again (the hook, on a Claude session's Bash call)
+  autopilot-fallback start [--reason R]      start the supervisor if API mode is active and none runs; returns at once
+  autopilot-fallback tick                    the same, quietly: what the launchd tick runs
+  autopilot-fallback config [set KEY VALUE]  show the settings, or change one (validated, within BOUNDS)
+  autopilot-fallback install-tick|uninstall-tick   the launchd tick
+
+Errors go to stderr with exit code 1 (2 for missing setup).
+"""
+
+import argparse
+import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+import traceback
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+
+
+def _load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+apc = _load("autopilot-coder")  # OpenRouter key, usage, the claude binary, model id checks
+SetupError, LinearError = apc.SetupError, apc.LinearError
+
+STATE_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_STATE_DIR", "~/.local/state/autopilot"))
+AGENT = "autopilot-fallback"
+# A limit holds until a Claude session runs a command again (bin/autopilot-runstate clears it). The
+# weekly limit can last days; this is only the backstop if nothing ever clears it.
+LIMIT_MAX_H = 8 * 24
+TICK_S = 300  # the launchd tick: how often it checks that a supervisor runs while API mode is active
+TICK_LABEL = "local.autopilot.fallback"
+TICK_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{TICK_LABEL}.plist")
+# The tick runs the copy that plugin updates refresh in place, not a versioned cache folder.
+STABLE_BIN = os.path.expanduser("~/.claude/plugins/marketplaces/autopilot/bin/autopilot-fallback")
+POLL_S = 30
+# A run whose result is in can still sit there (one run waited 15 minutes after its
+# last result, 2026-10-25). Past this after its result, it is stopped, but only while none of its
+# background tasks is open: a run waiting for one (the coder) also writes a result, then goes on
+# when the task ends (a run was cut off exactly so, 2026-10-25).
+RESULT_GRACE_S = 120
+
+
+def stream_events(chunk, state):
+    """Follow a run's stream-json output: open background tasks, and when its latest result came
+    with none open. `state` = {"open": set(), "idle_result": bool}."""
+    for line in chunk.splitlines():
+        if '"type":"system"' not in line and '"type":"result"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("session_id"):
+            state.setdefault("sessions", set()).add(d["session_id"])
+        if d.get("type") == "system" and d.get("subtype") == "task_started":
+            state["open"].add(d.get("task_id"))
+            state["idle_result"] = False
+        elif d.get("type") == "system" and d.get("subtype") == "task_notification":
+            state["open"].discard(d.get("task_id"))  # completed, failed or stopped: the run goes on
+            state["idle_result"] = False
+        elif d.get("type") == "result":
+            state["idle_result"] = not state["open"]
+    return state
+IDLE_S = 300  # a run that ended within two minutes (couldn't start, out of credit): wait before the next try
+FAST_FAILS = 3  # fast-ending runs in a row before the supervisor gives up until the next trigger
+NO_PROGRESS = 2  # runs in a row that left the queue as long as it was: what's left needs Claude or the owner
+# After giving up, neither the tick nor the hook starts it again until the queue changes or this passes;
+# only the owner switching API mode on does.
+GIVEUP_H = 6
+PROMPT = """Autopilot run (unattended; nobody will answer questions in chat).
+Agent: {agent}
+
+API mode ({reason}): you are not Claude. This run is on OpenRouter: you are {orchestrator}
+(orchestrator). Every review runs in a subagent on {reviewer} (Agent tool, model: opus), the
+code-review pass included: never review in your own context. The code is written through
+bin/autopilot-coder, by the model the ticket names on a "Coder model:" line or a "coder:<name>"
+label if it names one, else by the default coder {coder}. Follow the orchestrator skill's
+"API mode runs" rules.
+The helpers are on your PATH: call them by bare name and never write a path to one, e.g.
+AP=autopilot-linear; AI=autopilot-inflight; AG=autopilot-github; AC=autopilot-clobber; CODER=autopilot-coder
+then "$AI" lock <ID>, or directly: autopilot-inflight lock <ID>. Never use a heredoc
+(<<'EOF'): write each body with the Write tool to {state}/tmp/<ID>-<n>.md and pass --body-file <path>.
+No $(...) or backticks: read a value in one call, then write it literally in the next. No shell
+control flow (if, for, while) and no python3/node one-liners: one plain command per Bash call, or it
+is refused.
+
+Invoke the `autopilot:orchestrator` skill (Skill tool) and follow it exactly. It works one issue
+delegated to the Autopilot app, posting in Linear as Autopilot through the plugin's
+bin/autopilot-linear helper. Never post to Linear with the Linear MCP tools: they post as the owner.
+
+Hard rules (the skill repeats them):
+- no prod access of any kind;
+- never push to main;
+- no AI attribution in commits or PRs;
+- never print Keychain secrets or tokens;
+- never type passwords;
+- this run's OpenRouter spend stops at ${budget:.2f}.
+"""
+
+
+settings, spent_today = apc.settings, apc.spent_today
+
+
+def add_spend(usd, now=None):
+    return apc.add_spend(usd, "api_mode", now)
+
+
+def _p(name):
+    return os.path.join(STATE_DIR, name)
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _stamp(name):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(_p(name), "w") as f:
+        f.write(_now().strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+
+
+def _since(name):
+    try:
+        with open(_p(name)) as f:
+            return datetime.datetime.strptime(f.read().strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (OSError, ValueError):
+        return None
+
+
+def _rm(name):
+    try:
+        os.remove(_p(name))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def limited_since(now=None):
+    since = _since("claude-limited")
+    if since and (now or _now()) - since > datetime.timedelta(hours=LIMIT_MAX_H):
+        _rm("claude-limited")
+        return None
+    return since
+
+
+def active(now=None):
+    """Why API mode is on right now, or None."""
+    if os.path.exists(_p("paused")):
+        return None
+    if os.path.exists(_p("api-mode")):
+        return "api mode on"
+    if limited_since(now):
+        return "Claude usage limit"
+    return None
+
+
+def running():
+    """The supervisor's pid when one holds the lock, else None."""
+    try:
+        fd = os.open(_p("fallback.lock"), os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    except BlockingIOError:
+        try:
+            return int(os.read(fd, 32).decode().strip() or 0) or True
+        except ValueError:
+            return True
+    finally:
+        os.close(fd)
+
+
+def child_env(base, key, cfg, budget, root=None):
+    """The orchestrator on its model; every alias a subagent can name (reviewers) on the reviewer
+    model; background calls on the coder model (cheapest); the coder model for bin/autopilot-coder.
+    The installed plugin's bin/ comes first on PATH, so the helpers run by bare name: no path the
+    model writes can be wrong (Luna kept making paths up and was refused, 2026-10-25)."""
+    env = {k: v for k, v in base.items() if k not in apc.DROP_ENV and k != "CLAUDE_CODE_SUBAGENT_MODEL"}
+    env["PATH"] = os.path.join(root or skills_root(), "bin") + os.pathsep + base.get("PATH", "/usr/bin:/bin")
+    env.update({
+        "ANTHROPIC_BASE_URL": apc.API,
+        "ANTHROPIC_AUTH_TOKEN": key,
+        "ANTHROPIC_API_KEY": "",
+        "ANTHROPIC_MODEL": cfg["orchestrator"],
+        "ANTHROPIC_SMALL_FAST_MODEL": cfg["coder"],
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "AUTOPILOT_FALLBACK": "1",
+        "AUTOPILOT_CODER_MODEL": cfg["coder"],
+        "AUTOPILOT_FALLBACK_USD": f"{budget:.2f}",
+    })
+    for tier in ("FABLE", "OPUS", "SONNET"):
+        env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = cfg["reviewer"]
+    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg["coder"]
+    return env
+
+
+HELPERS = ("autopilot-linear", "autopilot-inflight", "autopilot-github", "autopilot-coder", "autopilot-clobber",
+           "autopilot-runstate")
+# What every run does, allowed up front: a headless run has none of the approvals the owner gave the
+# scheduled tasks in the app, and auto mode's check refused even an issue lock (2026-10-25). Anything
+# else still goes through auto mode's check. Rules match exact paths only (no wildcards in a path).
+BASE_RULES = (
+    "Bash(git -C:*)", "Bash(git fetch:*)", "Bash(git worktree:*)", "Bash(git ls-remote:*)",
+    "Bash(gh pr checks:*)", "Bash(gh pr view:*)", "Bash(gh pr list:*)", "Bash(gh pr diff:*)",
+    "Bash(gh run view:*)", "Bash(gh run watch:*)", "Bash(gh run list:*)",
+    "Bash(git diff:*)", "Bash(git status:*)", "Bash(git branch:*)", "Bash(git log:*)", "Bash(git rev-parse:*)",
+    "Bash(gh auth status:*)", "Bash(nohup autopilot-coder:*)",
+    "Bash(jq:*)", "Bash(date:*)", "Bash(test:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+    "Bash(grep:*)", "Bash(mkdir -p:*)", "Bash(touch:*)", "Bash(echo:*)", "Bash(printf:*)", "Bash(sed -n:*)",
+    "Bash(wc:*)", "Bash(sort:*)", "Bash(ps:*)", "Bash(sleep:*)", "Bash(true)",
+    "Read", "Glob", "Grep", "Skill", "ToolSearch", "TodoWrite", "Agent",
+)
+
+
+def plugin_roots(installed=None):
+    """Every folder the run may call Autopilot's helpers from: the installed copy (what the skills'
+    CLAUDE_PLUGIN_ROOT is), the marketplace copy, and this one."""
+    roots = {os.path.dirname(BIN), os.path.dirname(os.path.dirname(STABLE_BIN))}
+    installed = installed or os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+    try:
+        with open(installed) as f:
+            for entry in json.load(f).get("plugins", {}).get("autopilot@autopilot") or []:
+                if entry.get("installPath"):
+                    roots.add(entry["installPath"])
+    except (OSError, ValueError, AttributeError):
+        pass
+    return sorted(roots)
+
+
+def skills_root(installed=None):
+    """The plugin folder the run's skills come from (their CLAUDE_PLUGIN_ROOT): the installed copy."""
+    installed = installed or os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+    try:
+        with open(installed) as f:
+            for entry in json.load(f).get("plugins", {}).get("autopilot@autopilot") or []:
+                if entry.get("installPath"):
+                    return entry["installPath"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return os.path.dirname(BIN)
+
+
+def release_leftovers(session_ids, inflight=None):
+    """After a run ends: free the issue lock and run slot it still holds (the run should have, and
+    didn't, 2026-10-25), with the tokens bin/autopilot-runstate recorded for its session.
+    Without this its issue waits 2 hours for the lock to go stale."""
+    freed = []
+    for sid in session_ids:
+        if not sid or "/" in sid or sid.startswith("."):
+            continue
+        path = os.path.join(STATE_DIR, "runs", f"{sid}.json")
+        try:
+            with open(path) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        inflight = inflight or _load("autopilot-inflight")
+        if rec.get("issue") and rec.get("issue_token"):
+            try:
+                inflight.unlock(rec["issue"], rec["issue_token"])
+                freed.append(rec["issue"])
+            except SystemExit:
+                pass  # already taken over
+        if rec.get("slot") and rec.get("slot_token"):
+            try:
+                inflight.slot("release", rec["slot"], token=rec["slot_token"])
+                freed.append(f"slot {rec['slot']}")
+            except SystemExit:
+                pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return freed
+
+
+def allowed_tools(cfg, roots=None):
+    rules = [f"Bash({h}:*)" for h in HELPERS]  # by bare name, on the run's PATH (child_env)
+    rules += [f"Bash({r}/bin/{h}:*)" for r in (roots or plugin_roots()) for h in HELPERS]
+    state = "//" + STATE_DIR.strip("/")
+    rules += [f"Edit({state}/**)", f"Write({state}/**)"]
+    # The flags the skills clear (a prefix rule only matches whole words, so each one by name).
+    for name in (".queue-empty", "auth-broken", "github-broken", "linear-automations"):
+        rules += [f"Bash(rm -f {STATE_DIR}/{name})", f'Bash(rm -f "{STATE_DIR}/{name}")']
+    return rules + list(BASE_RULES) + list(cfg.get("allowed_tools") or [])
+
+
+def queue_count():
+    """Jobs no run has taken plus in-flight work no run holds: the scheduled tasks' own test, seen
+    as an API-mode run sees it (a `claude` wait isn't work for it)."""
+    env = {**os.environ, "AUTOPILOT_FALLBACK": "1"}
+
+    def count(name, *args):
+        try:
+            r = subprocess.run([os.path.join(BIN, name), *args], capture_output=True, text=True, timeout=120, env=env)
+        except subprocess.TimeoutExpired:
+            return 0
+        try:
+            return int(r.stdout.strip() or 0) if r.returncode == 0 else 0
+        except ValueError:
+            return 0
+    return count("autopilot-linear", "queue", "--count", "--queued") + count("autopilot-inflight", "count")
+
+
+def run_once(orouter, cfg, reason, budget, log, popen=subprocess.Popen, sleep=time.sleep, now=time.monotonic):
+    start = spent = orouter.usage()["usage_usd"]
+    os.makedirs(os.path.join(STATE_DIR, "tmp"), exist_ok=True)
+    prompt = PROMPT.format(agent=AGENT, reason=reason, budget=budget, state=STATE_DIR, **cfg)
+    argv = [apc.claude_bin(), "-p", "--model", cfg["orchestrator"], "--permission-mode", cfg["permission_mode"],
+            "--output-format", "stream-json", "--verbose", "--allowedTools", *allowed_tools(cfg)]
+    log.flush()
+    log_path, log_pos = getattr(log, "name", None), log.tell() if hasattr(log, "tell") else 0
+    proc = popen(argv, cwd=os.path.expanduser("~"), env=child_env(os.environ, orouter.key(), cfg, budget),
+                 stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True)
+    t0, stopped, misses, result_at = now(), None, 0, None
+    events = {"open": set(), "idle_result": False, "sessions": set()}
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+        while proc.poll() is None:
+            sleep(POLL_S)
+            if proc.poll() is not None:
+                break
+            if isinstance(log_path, str):
+                try:
+                    with open(log_path, "rb") as f:
+                        f.seek(log_pos)
+                        raw = f.read()
+                    cut = raw.rfind(b"\n") + 1  # whole lines only; the rest is read next time
+                    log_pos += cut
+                    stream_events(raw[:cut].decode(errors="replace"), events)
+                except OSError:
+                    pass
+                if not events["idle_result"]:
+                    result_at = None
+                elif result_at is None:
+                    result_at = now()
+            if result_at is not None and now() - result_at > RESULT_GRACE_S:
+                stopped = "finished"  # the run is done; only a lingering session is left
+                break
+            try:
+                spent, misses = orouter.usage()["usage_usd"], 0
+            except LinearError:
+                misses += 1
+            if spent - start > budget:
+                stopped = "budget"
+            elif now() - t0 > cfg["timeout_min"] * 60:
+                stopped = "timeout"
+            elif misses >= apc.USAGE_MISSES:
+                stopped = "usage-unknown"
+            if stopped:
+                break
+    finally:
+        apc._stop(proc)
+        if sys.exc_info()[0] is not None:  # killed or failed mid-run: still book it
+            apc.book_unfinished(orouter, start, add_spend)
+    if isinstance(log_path, str):  # the rest of the output, for the session ids
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(log_pos)
+                stream_events(f.read().decode(errors="replace"), events)
+        except OSError:
+            pass
+    freed = release_leftovers(events["sessions"])
+    sleep(apc.SETTLE_S)
+    try:
+        spent = orouter.usage()["usage_usd"]
+    except LinearError:
+        pass
+    cost = round(max(0.0, spent - start), 4)
+    out = {"exit": proc.returncode, "stopped": stopped, "cost_usd": cost, "seconds": round(now() - t0)}
+    if freed:
+        out["freed"] = freed
+    return out
+
+
+def supervise(orouter=None, run=run_once, count=queue_count, sleep=time.sleep, log_path=None):
+    """Hold the lock and work the queue while API mode is active. Returns the runs it made."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = os.open(_p("fallback.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return []
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    runs, fast, stuck = [], 0, 0
+    # A kill of the supervisor must still stop its paid run (run_once's finally) and free the lock.
+    old_term = signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    try:
+        with open(log_path or _p("fallback.log"), "a") as log:
+            try:
+                orouter = orouter or apc.OpenRouter()
+                while True:
+                    reason, cfg = active(), settings()
+                    left, before = cfg["usd_per_day"] - spent_today(), count()
+                    if not reason or left <= 0 or before <= 0:
+                        log.write(f"== {_now():%Y-%m-%dT%H:%M:%SZ} stop: {reason or 'API mode off'}, ${left:.2f} left today, queue {before}\n")
+                        break
+                    budget = min(cfg["usd_per_ticket"], left)
+                    log.write(f"\n== {_now():%Y-%m-%dT%H:%M:%SZ} {reason}: run on {cfg['orchestrator']}, budget ${budget:.2f}, queue {before}\n")
+                    log.flush()
+                    r = run(orouter, cfg, reason, budget, log)
+                    add_spend(r["cost_usd"])
+                    log.write(f"== done: {json.dumps(r)}\n")
+                    log.flush()
+                    runs.append(r)
+                    after = count()
+                    stuck = stuck + 1 if after >= before else 0
+                    # Fast and no progress = it couldn't start (out of credit, setup broken). A quick run
+                    # that did move the queue (a hand-off, a close) is fine: go straight on.
+                    fast = fast + 1 if r["seconds"] < 120 and after >= before else 0
+                    if fast >= FAST_FAILS or stuck >= NO_PROGRESS:
+                        why = "runs keep ending at once" if fast >= FAST_FAILS else "the queue left needs Claude or the owner"
+                        give_up(why, count())
+                        log.write(f"== stop: {why}; no restart until the queue changes or {GIVEUP_H} h pass\n")
+                        break
+                    if fast:
+                        sleep(IDLE_S)
+            except Exception:
+                log.write(f"== {_now():%Y-%m-%dT%H:%M:%SZ} supervisor error\n{traceback.format_exc()}\n")
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    return runs
+
+
+def give_up(why, queue):
+    with open(_p("fallback-giveup.json"), "w") as f:
+        json.dump({"since": _now().strftime("%Y-%m-%dT%H:%M:%SZ"), "why": why, "queue": queue}, f)
+
+
+def gave_up(count=None, now=None):
+    """The supervisor's last give-up, while it still holds: same queue, less than GIVEUP_H ago."""
+    try:
+        with open(_p("fallback-giveup.json")) as f:
+            g = json.load(f)
+        since = datetime.datetime.strptime(g["since"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if (now or _now()) - since > datetime.timedelta(hours=GIVEUP_H) or (count or queue_count)() != g.get("queue"):
+        _rm("fallback-giveup.json")
+        return None
+    return g
+
+
+def start(reason, popen=subprocess.Popen, count=None, owner=False):
+    """owner: the owner just switched API mode on (`mode on`), so a saved give-up doesn't hold."""
+    why = active()
+    if not why:
+        return {"started": False, "why": "API mode is off and Claude isn't limited"}
+    if owner:
+        _rm("fallback-giveup.json")  # the owner asked: try again now
+    else:
+        g = gave_up(count)
+        if g:
+            return {"started": False, "why": f"gave up at {g['since']} ({g['why']}); waits for the queue to change"}
+    if running():
+        return {"started": False, "why": "a fallback supervisor is already running", "pid": running()}
+    cfg = settings()
+    if spent_today() >= cfg["usd_per_day"]:
+        return {"started": False, "why": f"today's fallback budget (${cfg['usd_per_day']:.2f}) is spent"}
+    apc.OpenRouter().key()  # no key: setup error now, not in the background
+    popen([sys.executable, os.path.realpath(__file__), "_supervise"], start_new_session=True,
+          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    return {"started": True, "why": why, "reason": reason}
+
+
+def tick():
+    """The launchd tick: keep a supervisor going while API mode is active. Logs only what it did."""
+    if not active() or running():
+        return None
+    try:
+        out = start("tick")
+    except (SetupError, LinearError) as e:
+        out = {"started": False, "why": str(e)}
+    with open(_p("fallback-tick.log"), "a") as f:
+        f.write(f"{_now():%Y-%m-%dT%H:%M:%SZ} {json.dumps(out)}\n")
+    return out
+
+
+def _plist(binary, path_env):
+    from xml.sax.saxutils import escape
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{TICK_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{escape(binary)}</string><string>tick</string></array>
+  <key>StartInterval</key><integer>{TICK_S}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{escape(path_env)}</string></dict>
+  <key>StandardErrorPath</key><string>{escape(_p("fallback-tick.log"))}</string>
+</dict>
+</plist>
+"""
+
+
+def install_tick(run=subprocess.run):
+    binary = STABLE_BIN if os.path.exists(STABLE_BIN) else os.path.realpath(__file__)
+    # Runs need python3, gh, git and claude: launchd's own PATH has none of them. Rerun install-tick
+    # after moving any of them.
+    path_env = os.environ.get("PATH", "/usr/bin:/bin")
+    os.makedirs(os.path.dirname(TICK_PLIST), exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(TICK_PLIST, "w") as f:
+        f.write(_plist(binary, path_env))
+    domain = f"gui/{os.getuid()}"
+    run(["launchctl", "bootout", domain, TICK_PLIST], capture_output=True)
+    for attempt in range(5):  # bootstrap right after bootout can fail ("Bootstrap failed: 5") for a moment
+        r = run(["launchctl", "bootstrap", domain, TICK_PLIST], capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+        time.sleep(1)
+    if r.returncode != 0:
+        raise LinearError(f"launchctl bootstrap failed: {(r.stderr or '').strip()}")
+    return {"installed": TICK_PLIST, "runs": binary, "every_s": TICK_S}
+
+
+def uninstall_tick(run=subprocess.run):
+    run(["launchctl", "bootout", f"gui/{os.getuid()}", TICK_PLIST], capture_output=True)
+    return {"removed": _rm_path(TICK_PLIST)}
+
+
+def _rm_path(path):
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def status():
+    cfg = settings()
+    since = limited_since()
+    return {"active": active(), "api_mode": os.path.exists(_p("api-mode")), "tick_installed": os.path.exists(TICK_PLIST),
+            "claude_limited": since.strftime("%Y-%m-%dT%H:%M:%SZ") if since else None,
+            "running": running(), "spent_today_usd": round(spent_today(), 4),
+            "usd_per_day": cfg["usd_per_day"], "usd_per_ticket": cfg["usd_per_ticket"],
+            "models": {r: cfg[r] for r in ("orchestrator", "reviewer", "coder")}}
+
+
+def run(argv):
+    p = argparse.ArgumentParser(prog="autopilot-fallback")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    m = sub.add_parser("mode")
+    m.add_argument("value", choices=("on", "off"))
+    sub.add_parser("limited")
+    sub.add_parser("clear-limit")
+    s = sub.add_parser("start")
+    s.add_argument("--reason", default="manual")
+    sub.add_parser("tick")
+    c = sub.add_parser("config")
+    c.add_argument("action", nargs="?", choices=("set",))
+    c.add_argument("key", nargs="?")
+    c.add_argument("value", nargs="?")
+    sub.add_parser("install-tick")
+    sub.add_parser("uninstall-tick")
+    sub.add_parser("_supervise")
+    a = p.parse_args(argv)
+    if a.cmd == "status":
+        return status()
+    if a.cmd == "mode":
+        if a.value == "on":
+            settings()  # refuse a broken settings file before switching
+            _stamp("api-mode")
+            return {"api_mode": True, **start("api mode on", owner=True)}
+        return {"api_mode": False, "removed": _rm("api-mode"), "active": active()}
+    if a.cmd == "limited":
+        if not limited_since():
+            _stamp("claude-limited")
+        return {"claude_limited": True}
+    if a.cmd == "clear-limit":
+        return {"cleared": _rm("claude-limited")}
+    if a.cmd == "start":
+        return start(a.reason)
+    if a.cmd == "tick":
+        return tick()
+    if a.cmd == "config":
+        if not a.action:
+            return {"config": apc.CONFIG, "settings": settings(), "bounds": apc.BOUNDS,
+                    "spent_today_usd": spent_today()}
+        if not a.key or a.value is None:
+            raise LinearError("usage: config set KEY VALUE")
+        return {"config": apc.CONFIG, "settings": apc.set_setting(a.key, a.value)}
+    if a.cmd == "install-tick":
+        return install_tick()
+    if a.cmd == "uninstall-tick":
+        return uninstall_tick()
+    supervise()
+    return None
+
+
+def main(argv=None):
+    try:
+        out = run(sys.argv[1:] if argv is None else argv)
+    except SetupError as e:
+        print(f"autopilot-fallback: setup needed: {e}", file=sys.stderr)
+        return 2
+    except LinearError as e:
+        print(f"autopilot-fallback: {e}", file=sys.stderr)
+        return 1
+    if out is not None:
+        print(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

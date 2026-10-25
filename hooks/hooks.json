@@ -1,0 +1,15 @@
+{
+  "description": "Mirror an Autopilot run into its issue's Linear agent session, live (bin/autopilot-stream), and let Autopilot carry on by itself after a Claude usage limit (bin/autopilot-runstate). Both act only in sessions that hold Autopilot locks.",
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/autopilot-stream\"", "timeout": 15 }] },
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/autopilot-runstate\"", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/autopilot-stream\"", "timeout": 15 }] }
+    ],
+    "StopFailure": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/autopilot-runstate\"", "timeout": 20 }] }
+    ]
+  }
+}

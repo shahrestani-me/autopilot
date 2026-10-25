@@ -1,0 +1,102 @@
+# A made-up web app (frontend + API), showing every section of the config. Copy it to
+# ~/.config/autopilot/projects/<name>.yaml and replace each value with your project's.
+# Project configs live there, outside this repo: nothing about a consumer project belongs here.
+version: 1
+name: web-app
+description: Example web app (React frontend + Python API), with a preprod environment.
+
+linear:
+  team: ENG
+  projects: ["Web App"]
+  states:
+    in_progress: In Progress
+    merged: In Review          # merged, verifying on preprod
+    waiting: Todo              # waiting for a check or another ticket; never In Progress
+    done: Done
+    blocked: Blocked           # waiting for the owner; they're @mentioned (worker blocked, wait: owner)
+  followup_state: Backlog
+  owner: Jane Doe              # gets the preprod sign-in notices
+  release_checks_project: Web App Release   # owner-only checks, gone through before a prod release
+
+repos:
+  - name: web
+    github: example-org/web
+    path: ~/src/web
+    role: frontend (React / TypeScript)
+    setup:
+      - cd $WT && npm ci
+    checks:
+      - npx tsc --noEmit
+      - npx jest --ci <related tests>
+      - npx eslint .
+    ci_review:                 # a CI review that approves the head on PASS
+      check: claude-review
+      approver: github-actions[bot]
+    deploy_workflows: [deploy.yml]
+    notes:
+      - Every user-facing string needs a translation in each supported locale.
+  - name: api
+    github: example-org/api
+    path: ~/src/api
+    role: backend (FastAPI)
+    checks:
+      - cd $WT && .venv/bin/python -m pytest -m unit -q
+    known_local_failures:
+      - "macOS: tests/unit/test_render.py fails on font metrics; passes in CI"
+    deploy_workflows: [deploy.yml]
+    notes:
+      - API changes must be backward-compatible (additive only); old clients stay in use.
+
+git:
+  branch_prefix: autopilot/
+  worktree_root: ~/src/.autopilot-worktrees
+  ticket_id_in_branch_or_title: false
+
+merge:
+  policy: merge-all
+  max_ci_cycles: 3
+  max_review_loops: 3
+  reviewer_model: sonnet
+  code_review: high           # /code-review on every PR of a repo without ci_review (worker section 5)
+
+preprod:
+  web_url: https://staging.example.com
+  api_hosts: [api.staging.example.com]
+  browser: chrome
+  test_users:
+    - name: test-user
+      role: default non-admin test account, so writes are fine
+      signed_in_where: main Chrome profile
+  keepalive:
+    url: https://staging.example.com/settings
+    every_hours: 20
+    user: test-user
+    session_jwt_storage_key: auth_token
+    warn_hours: 24
+  recipes:
+    - Hard-reload after a deploy so the new bundle loads. Check Settings shows test-user before testing.
+    - Drive the UI; read network responses with read_network_requests. Never read tokens or cookies to call the API yourself.
+    - Prefix test data with [autopilot] and delete it afterwards.
+  known_fixes:
+    - when: GitHub CLI auth expired
+      do: run `gh auth login -h github.com`
+    - when: preprod Chrome signed out, or the wrong user
+      do: open https://staging.example.com/settings; sign in as test-user
+
+forbidden:
+  hosts: [example.com, api.example.com]
+  gcp_projects: [example-prod]
+  commands: ["gh release create"]
+  workflows: [release.yml]
+
+coder:                         # an issue with a coder:<model> label or "Coder model:" line gets its code written by that model (worker section 3)
+  models:
+    deepseek: deepseek/deepseek-v4.1-flash
+
+spend:
+  paid_model_usd_per_ticket: 1
+  never:
+    - run paid live evals
+
+reports:
+  dir: ~/autopilot-reports

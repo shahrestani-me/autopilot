@@ -1,0 +1,31 @@
+# Autopilot gateway. Copy to wrangler.toml (git-ignored) and fill in your own values; see
+# docs/gateway.md. Nothing in it is secret, but it is your deployment, so it stays out of the repo.
+name = "autopilot-gateway"
+main = "src/index.js"
+account_id = "<your Cloudflare account id>"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# Secrets (LINEAR_WEBHOOK_SECRET, GATEWAY_TOKEN, LINEAR_CLIENT_ID, LINEAR_CLIENT_SECRET) are set
+# with `wrangler secret put` (bin/autopilot-gateway-setup), GITHUB_WEBHOOK_SECRET and
+# GITHUB_APP_PRIVATE_KEY by bin/autopilot-github-setup worker-secrets. None live in this file.
+[vars]
+RUNNER_INTERVAL_MIN = "10"  # the autopilot-agent scheduled task's cadence
+# Linear user ids allowed to start work by delegating, mentioning or replying (the owner).
+ALLOWED_USER_IDS = "<your Linear user id>"
+# The Autopilot app's own Linear user id (not secret): sessions it opens itself are not new work.
+APP_USER_ID = "<the Autopilot app's Linear user id>"
+# The Autopilot GitHub App (not secret). Mentions of @<slug> on PRs become jobs (src/github.js).
+GITHUB_APP_ID = "<your GitHub App id>"
+GITHUB_APP_SLUG = "<your GitHub App slug>"
+# GitHub logins allowed to give Autopilot work by mentioning it on a PR (the owner).
+ALLOWED_GITHUB_LOGINS = "<your GitHub login>"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "autopilot-gateway"
+database_id = "<from `wrangler d1 create autopilot-gateway`>"
+migrations_dir = "migrations"
+
+[observability]
+enabled = true

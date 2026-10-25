@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""autopilot-clobber: refuse a merge that silently deletes someone else's newer work.
+
+A branch that was started from an older main and then rebased, squashed or conflict-resolved
+carelessly can carry the *old* contents of files that another PR changed in the meantime. Its diff
+then deletes that other PR's lines. CI stays green when the other PR's tests are deleted along with
+its code, and the PR title says nothing about it. This is how a CI-only PR (gitleaks,
+2026-09-14) wiped all of the PR before it, 57 minutes after that one merged.
+
+The signal: a line the change deletes that landed on the base branch **after** the change's author
+last saw the base (`--since`: when the branch was started or the PR opened). The author never saw
+that line, so deleting it is almost certainly a stale overwrite, not a decision. Every deleted line
+is blamed in the base version; lines whose origin commit landed after `--since` are reported,
+grouped by origin commit.
+
+  check  --repo-dir DIR --base REF --head REF (--since ISO8601 | --github OWNER/REPO --pr N)
+         [--allow SHA ...] [--min-lines N] [--allow-behind]
+         The pre-merge gate. Compares HEAD against merge-base(BASE, HEAD), i.e. exactly the PR's diff.
+         Exit 0 = clean, 3 = clobber found, 4 = HEAD is behind BASE (its checks never ran on the code
+         that would land; rebase), 2 = usage/git error. JSON on stdout for 0, 3 and 4.
+         An intended deletion of newer work is allowed by naming its origin commit with --allow.
+  audit  --repo-dir DIR --github OWNER/REPO [--limit N]
+         The same test on every merged PR's merge commit (first-parent diff), with `since` = the
+         earlier of the PR's creation and its first commit. Prints one JSON object per flagged PR.
+
+Stdlib only; reads git and (audit) `gh`. Never writes anything.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+BLAME_HEAD = re.compile(r"^([0-9a-f]{40}) \d+ \d+(?: \d+)?$")
+
+
+class GitError(Exception):
+    pass
+
+
+def git(repo, *args):
+    # errors="replace": a file in history may not be UTF-8; only line counts and blame headers matter.
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, errors="replace")
+    if p.returncode != 0:
+        raise GitError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p.stdout
+
+
+def epoch(iso):
+    """ISO 8601 (with Z or an offset) → epoch seconds."""
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    if dt.tzinfo is None:  # never the machine's local time
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def git_path(raw, prefix=""):
+    """A path as git prints it: C-quoted ("a/x\\"y") when it holds a quote, backslash or control
+    character, even with core.quotePath=false, and followed by a tab when it holds a space. Unquote it
+    and drop the a/ or b/ prefix."""
+    raw = raw.rstrip("\t")
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape") \
+            .encode("latin-1").decode("utf-8", "replace")
+    return raw[len(prefix):] if prefix and raw.startswith(prefix) else raw
+
+
+def deleted_ranges(repo, old, new):
+    """{path: [(start, count), ...]} of lines deleted going old → new, plus the set of deleted files."""
+    # Renames stay detected, so a moved file's lines are not "deleted"; quotePath off, so paths
+    # with non-ASCII characters come through as-is instead of as quoted escapes.
+    diff = git(repo, "-c", "core.quotePath=false", "diff", "-U0", "-M", "--no-color", old, new)
+    ranges, deleted_files, path = {}, set(), None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path = None
+        elif line.startswith("--- "):
+            path = None if line == "--- /dev/null" else git_path(line[4:], "a/")
+        elif line.startswith("+++ ") and line == "+++ /dev/null" and path:
+            deleted_files.add(path)
+        elif line.startswith("@@") and path:
+            m = HUNK.match(line)
+            if m:
+                start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+                if count:
+                    ranges.setdefault(path, []).append((start, count))
+    return ranges, deleted_files
+
+
+def changed_binaries(repo, old, new):
+    """{path: deleted?} for binary files (no hunks) the change deletes or rewrites in place."""
+    out = git(repo, "diff", "--numstat", "-M", "-z", old, new).split("\0")
+    found, i = {}, 0
+    while i < len(out) - 1:
+        added, removed, path = out[i].split("\t", 2)
+        moved_to = None
+        if path == "":  # a rename: old and new path follow as their own fields
+            path, moved_to, i = out[i + 1], out[i + 2], i + 3
+        else:
+            i += 1
+        if added != "-" or removed != "-":
+            continue
+        if not git(repo, "ls-tree", "--name-only", old, "--", path).strip():
+            continue  # a binary the change adds: nothing of anyone's to lose
+        if moved_to is not None:
+            # Moved intact: nothing lost. Moved and rewritten: the old path's content was replaced.
+            if git(repo, "rev-parse", f"{old}:{path}").strip() != git(repo, "rev-parse", f"{new}:{moved_to}").strip():
+                found[path] = False
+            continue
+        found[path] = git(repo, "ls-tree", "--name-only", new, "--", path).strip() == ""
+    return found
+
+
+def added_lines(repo, old, new):
+    """{path: {stripped line, ...}} of non-trivial lines the change adds, by their path in `new`."""
+    diff = git(repo, "-c", "core.quotePath=false", "diff", "-U0", "-M", "--no-color", old, new)
+    added, path = {}, None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = None if line == "+++ /dev/null" else git_path(line[4:], "b/")
+        elif line.startswith("+") and path and not line.startswith("+++"):
+            text = line[1:].strip()
+            if len(text) >= 4 and any(ch.isalnum() for ch in text):
+                added.setdefault(path, set()).add(text)
+    return added
+
+
+def resurrections(repo, old, new, since, allow=()):
+    """Lines the change adds back that a commit landed after `since` had removed, and that are not
+    in `old` any more: a stale copy undoing someone's deletion. {sha: {summary, landed, files}}."""
+    adds = added_lines(repo, old, new)
+    if not adds:
+        return {}
+    found = {}
+    for row in git(repo, "log", "--no-merges", "--format=%H %ct %s", old).splitlines():
+        sha, when, summary = (row + "  ").split(" ", 2)
+        summary = summary.strip()
+        if int(when) <= since:  # not `break`: log order isn't strictly by commit time
+            continue
+        if any(sha.startswith(a) for a in allow if a):
+            continue
+        removed, path = {}, None
+        for line in git(repo, "-c", "core.quotePath=false", "diff", "-U0", "-M", "--no-color",
+                        f"{sha}^", sha).splitlines():
+            if line.startswith("--- "):
+                path = None if line == "--- /dev/null" else git_path(line[4:], "a/")
+            elif line.startswith("-") and path and not line.startswith("---"):
+                removed.setdefault(path, set()).add(line[1:].strip())
+        for path, lines in removed.items():
+            back = adds.get(path, set()) & lines
+            if not back:
+                continue
+            still = {l.strip() for l in git(repo, "show", f"{old}:{path}").splitlines()} if \
+                git(repo, "ls-tree", "--name-only", old, "--", path).strip() else set()
+            back -= still
+            # One line re-added (an import a newer change dropped and this PR needs again) is a normal
+            # edit; a stale copy brings back blocks.
+            if len(back) >= 2:
+                f = found.setdefault(sha, {"summary": summary, "landed": int(when), "files": {}})
+                f["files"][path] = f["files"].get(path, 0) + len(back)
+    return found
+
+
+def blame_origins(repo, rev, path, spans):
+    """[(origin sha, committer epoch, summary)] for every line in spans of path at rev."""
+    args = ["blame", "--porcelain", "--ignore-revs-file="]  # repo/user ignore-revs would hide the real origin
+    for start, count in spans:
+        args += ["-L", f"{start},+{count}"]
+    out = git(repo, *args, rev, "--", path)
+    meta, lines, sha = {}, [], None
+    for line in out.splitlines():
+        m = BLAME_HEAD.match(line)
+        if m:
+            sha = m.group(1)
+            meta.setdefault(sha, {})
+        elif line.startswith("\t"):
+            lines.append((sha, not line[1:].strip()))
+        elif sha and line.startswith("committer-time "):
+            meta[sha]["time"] = int(line.split()[1])
+        elif sha and line.startswith("summary "):
+            meta[sha]["summary"] = line[8:]
+    return [(s, meta[s].get("time", 0), meta[s].get("summary", ""), blank) for s, blank in lines]
+
+
+def find_clobbers(repo, old, new, since, allow=(), min_lines=1):
+    """Lines deleted going old → new whose origin (blamed at old) landed after `since` (epoch).
+
+    Also counts lines it adds back that such a commit had removed (`resurrected`: {path: n}).
+    Returns [{origin, summary, landed, lines, files: {path: n}, deleted_files: [...], resurrected?}],
+    biggest first, keeping only origins with at least min_lines deleted lines.
+    """
+    ranges, deleted_files = deleted_ranges(repo, old, new)
+    found = {}
+    hits_by_path = [(path, blame_origins(repo, old, path, spans)) for path, spans in ranges.items()]
+    for path, gone in changed_binaries(repo, old, new).items():
+        # No lines to blame: deleting or rewriting a binary counts as one line of its last change.
+        sha, when, summary = (git(repo, "log", "-1", "--format=%H %ct %s", old, "--", path).strip() + "  ").split(" ", 2)
+        summary = summary.strip()
+        if gone:
+            deleted_files.add(path)
+        hits_by_path.append((path, [(sha, int(when), summary, False)]))
+    for path, origins in hits_by_path:
+        for sha, when, summary, blank in origins:
+            # A blank line is no one's work: dropping one while resolving a conflict is not a clobber.
+            if blank or when <= since or any(sha.startswith(a) for a in allow if a):
+                continue
+            f = found.setdefault(sha, {"origin": sha, "summary": summary, "landed": when,
+                                       "lines": 0, "files": {}, "deleted_files": []})
+            f["lines"] += 1
+            f["files"][path] = f["files"].get(path, 0) + 1
+            if path in deleted_files and path not in f["deleted_files"]:
+                f["deleted_files"].append(path)
+    for sha, r in resurrections(repo, old, new, since, allow).items():
+        f = found.setdefault(sha, {"origin": sha, "summary": r["summary"], "landed": r["landed"],
+                                   "lines": 0, "files": {}, "deleted_files": []})
+        f["resurrected"] = r["files"]
+        f["lines"] += sum(r["files"].values())
+    hits = [f for f in found.values() if f["lines"] >= min_lines]
+    for f in hits:
+        f["landed"] = datetime.fromtimestamp(f["landed"], timezone.utc).isoformat()
+    return sorted(hits, key=lambda f: -f["lines"])
+
+
+def cmd_check(a):
+    if a.since:
+        since = epoch(a.since)
+    elif a.pr and a.github:
+        since = pr_since(gh_json(["pr", "view", str(a.pr), "-R", a.github, "--json", "createdAt,commits"]))
+    else:
+        raise GitError("check needs --since, or --github with --pr")
+    base = git(a.repo_dir, "merge-base", a.base, a.head).strip()
+    behind = base != git(a.repo_dir, "rev-parse", a.base).strip()
+    hits = find_clobbers(a.repo_dir, base, a.head, since, a.allow or (), a.min_lines)
+    stale = behind and not a.allow_behind
+    print(json.dumps({"ok": not hits and not stale, "behind": behind, "merge_base": base,
+                      "head": git(a.repo_dir, "rev-parse", a.head).strip(),
+                      "since": datetime.fromtimestamp(since, timezone.utc).isoformat(), "clobbers": hits},
+                     indent=2))
+    return 3 if hits else 4 if stale else 0
+
+
+def gh_json(args):
+    p = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise GitError(f"gh {' '.join(args[:2])}: {p.stderr.strip()}")
+    return json.loads(p.stdout)
+
+
+MERGED_PRS = """query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: MERGED, first: 50, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title url createdAt mergedAt mergeCommit { oid }
+              commits(first: 1) { nodes { commit { authoredDate committedDate } } } }
+    }
+  }
+}"""
+
+
+def merged_prs(github, limit):
+    """Merged PRs with only their first commit: `gh pr list --json commits` is too big a query for GitHub."""
+    owner, name = github.split("/", 1)
+    p = subprocess.run(["gh", "api", "graphql", "--paginate", "-f", f"query={MERGED_PRS}", "-F", f"owner={owner}",
+                        "-F", f"name={name}", "--jq", ".data.repository.pullRequests.nodes[]"],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        raise GitError(f"gh api graphql: {p.stderr.strip()}")
+    prs = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+    for pr in prs:
+        pr["commits"] = [n["commit"] for n in pr["commits"]["nodes"]]
+    return prs[-limit:]
+
+
+def pr_since(pr):
+    """When the author last saw the base, at the latest: PR creation or its first commit, whichever is earlier."""
+    times = [epoch(pr["createdAt"])]
+    for c in pr.get("commits") or []:
+        for key in ("authoredDate", "committedDate"):
+            if c.get(key):
+                times.append(epoch(c[key]))
+    return min(times)
+
+
+def cmd_audit(a):
+    flagged = 0
+    for pr in sorted(merged_prs(a.github, a.limit), key=lambda p: p["mergedAt"]):
+        sha = (pr.get("mergeCommit") or {}).get("oid")
+        if not sha:
+            continue
+        try:
+            parent = git(a.repo_dir, "rev-parse", f"{sha}^1").strip()
+            hits = find_clobbers(a.repo_dir, parent, sha, pr_since(pr), (), a.min_lines)
+        except GitError as e:
+            print(json.dumps({"pr": pr["number"], "error": str(e)[:300]}), flush=True)
+            continue
+        if hits:
+            flagged += 1
+            print(json.dumps({"pr": pr["number"], "title": pr["title"], "url": pr["url"],
+                              "merge_commit": sha, "created": pr["createdAt"], "merged": pr["mergedAt"],
+                              "clobbers": [{k: h[k] for k in ("origin", "summary", "landed", "lines",
+                                                              "files", "deleted_files")} | ({"resurrected": h["resurrected"]} if "resurrected" in h else {})
+                                             for h in hits]}),
+                  flush=True)
+    print(json.dumps({"done": True, "flagged": flagged}), flush=True)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="autopilot-clobber", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="pre-merge gate: does HEAD delete base lines newer than --since?")
+    c.add_argument("--repo-dir", default=".")
+    c.add_argument("--base", required=True, help="the base branch ref, e.g. origin/main (fetch first)")
+    c.add_argument("--head", required=True, help="the commit about to be merged")
+    c.add_argument("--since", help="ISO 8601: when the branch was started / the PR opened")
+    c.add_argument("--github", help="OWNER/REPO: with --pr, derive --since from the PR")
+    c.add_argument("--pr", type=int, help="PR number: since = its creation or first commit, whichever is earlier")
+    c.add_argument("--allow", action="append", help="origin commit (prefix) whose newer lines may be deleted")
+    c.add_argument("--min-lines", type=int, default=1)
+    c.add_argument("--allow-behind", action="store_true",
+                   help="don't fail when HEAD lacks the base's newest commits (pre-push checks only)")
+    u = sub.add_parser("audit", help="run the same test on every merged PR of a repo")
+    u.add_argument("--repo-dir", default=".")
+    u.add_argument("--github", required=True, help="OWNER/REPO")
+    u.add_argument("--limit", type=int, default=1000)
+    u.add_argument("--min-lines", type=int, default=1)
+    a = ap.parse_args(argv)
+    try:
+        return cmd_check(a) if a.cmd == "check" else cmd_audit(a)
+    except Exception as e:  # any failure is exit 2 ("not a pass"), never a stray 1
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

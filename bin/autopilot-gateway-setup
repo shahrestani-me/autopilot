@@ -1,0 +1,76 @@
+#!/bin/bash
+# autopilot-gateway-setup: store the gateway's secrets in the macOS Keychain (service
+# autopilot-gateway) and as Cloudflare Worker secrets. The OWNER runs this in their own
+# Terminal; values travel only through pipes and `security -i` stdin, never argv, files,
+# shell history or output. See docs/gateway.md.
+#
+#   bin/autopilot-gateway-setup url <https://...workers.dev>   store the gateway URL (not secret)
+#   bin/autopilot-gateway-setup runner-token                    new shared runner token -> Keychain + Worker
+#   bin/autopilot-gateway-setup linear-client                   Linear client id/secret: Keychain autopilot-linear -> Worker
+#   bin/autopilot-gateway-setup webhook-secret                  prompts for Linear's signing secret -> Keychain + Worker
+#   bin/autopilot-gateway-setup all <url>                       all four, in that order
+set -euo pipefail
+
+SERVICE=autopilot-gateway
+WRANGLER=(npx --yes wrangler@4.151.1)
+# Wrangler authenticates with the owner's scoped deploy token (Workers Scripts + D1 edit only),
+# read from the Keychain for this script's run. No `wrangler login` needed.
+CLOUDFLARE_API_TOKEN="$(security find-generic-password -s autopilot-cloudflare -a deploy-token -w 2>/dev/null)" \
+  || { echo "Keychain has no autopilot-cloudflare/deploy-token; see docs/gateway.md" >&2; exit 2; }
+export CLOUDFLARE_API_TOKEN
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+cd "$(dirname "$SELF")/../gateway"
+
+keychain_put() { # account, value (value via stdin of security -i, never argv)
+  local account=$1 value=$2
+  [[ $value =~ ^[A-Za-z0-9_.:/-]+$ ]] || { echo "refusing: unexpected characters in $account" >&2; return 1; }
+  printf 'add-generic-password -U -s %s -a %s -w "%s"\n' "$SERVICE" "$account" "$value" | security -i
+  [[ "$(security find-generic-password -s "$SERVICE" -a "$account" -w)" == "$value" ]] \
+    || { echo "could not write $SERVICE/$account to the Keychain" >&2; return 1; }
+}
+
+worker_put() { # name; value on stdin
+  "${WRANGLER[@]}" secret put "$1" >/dev/null && echo "Worker secret $1 set."
+}
+
+do_url() {
+  local url=${1:?usage: $0 url https://autopilot-gateway.<subdomain>.workers.dev}
+  [[ $url =~ ^https://[A-Za-z0-9.-]+$ ]] || { echo "the URL must be https://host with no path" >&2; return 1; }
+  keychain_put url "$url" || return 1
+  echo "Keychain $SERVICE/url stored."
+}
+
+do_runner_token() {
+  local t
+  t=$(openssl rand -hex 32)
+  keychain_put token "$t" || return 1
+  echo "Keychain $SERVICE/token stored."
+  printf %s "$t" | worker_put GATEWAY_TOKEN
+  unset t
+}
+
+do_linear_client() {
+  security find-generic-password -s autopilot-linear -a client-id -w | tr -d '\n' | worker_put LINEAR_CLIENT_ID
+  security find-generic-password -s autopilot-linear -a client-secret -w | tr -d '\n' | worker_put LINEAR_CLIENT_SECRET
+}
+
+do_webhook_secret() {
+  local s
+  # `|| [[ -n $s ]]`: piped input without a final newline (pbpaste) makes read return 1.
+  read -rs -p "Paste the webhook signing secret from the Autopilot app's settings in Linear (input hidden): " s || [[ -n $s ]]
+  echo
+  [[ -n $s ]] || { echo "nothing pasted" >&2; return 1; }
+  keychain_put webhook-secret "$s" || return 1
+  echo "Keychain $SERVICE/webhook-secret stored."
+  printf %s "$s" | worker_put LINEAR_WEBHOOK_SECRET
+  unset s
+}
+
+case "${1:-}" in
+  url) do_url "${2:-}" ;;
+  runner-token) do_runner_token ;;
+  linear-client) do_linear_client ;;
+  webhook-secret) do_webhook_secret ;;
+  all) do_url "${2:-}" && do_runner_token && do_linear_client && do_webhook_secret ;;
+  *) sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

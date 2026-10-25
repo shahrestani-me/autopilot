@@ -1,0 +1,10 @@
+{
+  "name": "autopilot-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "dev": "npx wrangler@4.151.1 dev",
+    "deploy": "npx wrangler@4.151.1 deploy"
+  }
+}

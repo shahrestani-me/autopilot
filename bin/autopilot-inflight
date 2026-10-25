@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""autopilot-inflight: what Autopilot has in flight, so runs finish before they start, and the
+locks that let up to MAX_RUNS runs work side by side.
+
+The owner's rules (2026-10-20): at most MAX_RUNS (default 3, $AUTOPILOT_MAX_RUNS) tickets in
+flight. A ticket is in flight while a run works on it (its issue lock) or any of Autopilot's PRs
+for it is open, green or red. Runs first finish, fix or rebase in-flight work, and take a new
+ticket only while there is capacity, and only one that is independent of everything in flight
+(no Linear blocks/parent tie, no PR touching the same files).
+
+A run that blocks records what it waits for (`wait`). The sweep resumes it by itself once
+something it can see has changed (the PR head, the base branch, the checks), unless it waits
+for the owner: their reply arrives as a gateway job for that issue.
+
+  autopilot-inflight sweep [--repo OWNER/NAME ...] [--author app/<slug>]
+      {"slot_taken": bool, "next": <item>|null, "deferred_next": <wait>|null,
+       "stalled": [<item>...], "inflight": [<item>...], "waiting_no_pr": [...]}
+      Without --repo: every `github: OWNER/NAME` in the project configs.
+      stalled: in-flight work that holds the slot and needs the owner, not yet notified:
+      checks pending for STALL_HOURS, or a block retried AUTO_RETRY_CAP times without progress.
+  autopilot-inflight count [--repo ...]
+      Prints one number: actionable in-flight items + deferred work + stalled items. The
+      scheduled task's fast exit adds it to the gateway's count, so a run wakes for them.
+  autopilot-inflight claim <ID>
+      A run takes in-flight work back: counts an automatic retry (kept across blocks).
+  autopilot-inflight notified <ID>
+      The owner was push-notified about this stall: don't report it again.
+  autopilot-inflight slot take [--agent NAME] | slot touch N --token T | slot release N --token T | slot busy
+      A run's slot: one of MAX_RUNS lock files ({"slot": N, "token": T} or {"slot": null} when all
+      are busy). `busy` prints how many are taken (the scheduled fast exit uses it). --agent names
+      the scheduled task that started the run ("autopilot-agent-2"); it's echoed back as "agent",
+      for the hooks to show in the issue's Linear session. The slot number isn't tied to the task.
+  autopilot-inflight lock NAME [--wait SECONDS] | lock NAME --touch --token T | unlock NAME --token T
+      An exclusive lock: an issue id while a run works on it, or "verify" (the preprod browser and
+      test user) and "keepalive". {"locked": true, "token": T} or {"locked": false, "holder": ...}.
+  Every lock and slot has an owner token: only its holder can touch or release it. One not touched
+  for LOCK_STALE_S (2 h) belongs to a run that died and is taken over (one taker at a time).
+  autopilot-inflight overlap <ID> --files PATH [PATH ...]
+      Other in-flight issues whose open PRs touch any of these files: {"conflicts": [...]}.
+      item: {"issue": "ENG-1"|null, "status": "merge-ready"|"ci-red"|"conflict"|"pending"|"held-draft",
+             "action": "finish"|"rebase"|"fix-ci"|null, "actionable": bool, "reason": "...",
+             "prs": [{"repo", "number", "url", "title", "draft", "mergeable", "checks", "failing", ...}],
+             "waiting": {...}|null}
+  autopilot-inflight wait <ID> --kind owner|checkable|slot|claude --reason "..." --repo OWNER/NAME [...]
+      Records the block with a fingerprint of the issue's open PRs and their base branches.
+      owner: waits for the owner's reply. checkable: resumes once the fingerprint changes.
+      slot: new work the owner asked for while another ticket was in flight; `deferred_next`
+      offers the oldest one as soon as nothing is in flight, before any new delegation.
+      claude: a step an API-mode run can't do (preprod in the owner's browser); offered like a
+      slot wait, but only to Claude runs (no AUTOPILOT_FALLBACK=1 in the environment).
+  autopilot-inflight clear <ID>
+      Forgets the block and its retry count (done, or the owner answered).
+  autopilot-inflight interrupted <ID>
+      {"count": n, "last": stamp|null}: how often a Claude usage limit (or another API outage) cut a
+      run of this issue off. Those stops are not the issue's fault: they don't count as attempts.
+      The plugin's StopFailure hook (bin/autopilot-runstate) records them; `clear` forgets them.
+  autopilot-inflight plugin-check
+      {"running": "0.9.0", "installed": "0.9.1", "stale": bool}: whether the plugin was updated
+      after this run started. A stale run hands its issue over instead of finishing on old rules.
+
+Reads go through the owner's `gh` login; this tool never writes to GitHub.
+State: $AUTOPILOT_STATE_DIR (default ~/.local/state/autopilot)/waiting/<ID>.json.
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+
+STATE_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_STATE_DIR", "~/.local/state/autopilot"))
+CONFIG_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_CONFIG_DIR", "~/.config/autopilot/projects"))
+CONFIG_REPO = re.compile(r"^\s*github:\s*([\w.-]+/[\w.-]+)\s*(#.*)?$")
+AUTO_RETRY_CAP = 2   # automatic resumes of one issue without the owner, then it's theirs
+MAX_RUNS = int(os.environ.get("AUTOPILOT_MAX_RUNS") or 3)
+LOCK_STALE_S = 2 * 3600  # not touched this long: its run died (runs touch between phases)
+TAKEOVER_STALE_S = 60   # a takeover marker older than this belongs to a taker that died
+LOCK_NAME = re.compile(r"^(?:[A-Z][A-Z0-9]*-\d+|verify|keepalive)$")
+STALL_HOURS = 2      # checks pending this long while holding the slot → tell the owner
+# PRs Autopilot authored: its GitHub App's slug (Keychain autopilot-github/app-slug, or
+# AUTOPILOT_GITHUB_APP_SLUG), as `gh pr list --author app/<slug>` wants it.
+DEFAULT_APP_SLUG = "claude-autopilot"
+PART_OF = re.compile(r"Part of ([A-Z][A-Z0-9]*-\d+)")
+ISSUE_ID = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+# A scheduled task's name, as the Claude desktop app shows it ("autopilot-agent-2").
+AGENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+PR_FIELDS = "number,url,title,body,headRefName,headRefOid,baseRefName,isDraft,mergeable,statusCheckRollup,createdAt,files"
+
+RED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+# Most urgent first: a draft is the owner's hold, then what a run can act on, then waiting.
+STATUS_RANK = {"held-draft": 0, "conflict": 1, "ci-red": 2, "pending": 3, "merge-ready": 4}
+ACTION = {"merge-ready": "finish", "conflict": "rebase", "ci-red": "fix-ci"}
+ACTION_ORDER = {"finish": 0, "rebase": 1, "fix-ci": 2}
+
+
+class GhError(Exception):
+    pass
+
+
+def configured_repos(config_dir=None):
+    """Every `github: OWNER/NAME` in the project configs (no YAML parser needed)."""
+    repos = []
+    for path in sorted(glob.glob(os.path.join(config_dir or CONFIG_DIR, "*.yaml"))):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                m = CONFIG_REPO.match(line)
+                if m and m.group(1) not in repos:
+                    repos.append(m.group(1))
+    return repos
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _stamp(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse(stamp):
+    return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+def run_gh(args):
+    """`gh <args>` → stdout. Swappable in tests."""
+    p = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise GhError(f"gh {' '.join(args[:3])}...: {p.stderr.strip() or p.returncode}")
+    return p.stdout
+
+
+def checks_state(rollup):
+    """(state, failing names) for a PR's statusCheckRollup: green, red or pending."""
+    failing, pending = [], False
+    for c in rollup or []:
+        name = c.get("name") or c.get("context") or "?"
+        if c.get("__typename") == "StatusContext" or c.get("state"):
+            s = (c.get("state") or "").upper()
+            if s in RED:
+                failing.append(name)
+            elif s in ("PENDING", "EXPECTED", ""):
+                pending = True
+            continue
+        if (c.get("status") or "").upper() != "COMPLETED":
+            pending = True
+        elif (c.get("conclusion") or "").upper() in RED:
+            failing.append(name)
+    if failing:
+        return "red", sorted(failing)
+    return ("pending" if pending else "green"), []
+
+
+def pr_status(pr):
+    if pr["draft"]:
+        return "held-draft"
+    if pr["mergeable"] == "CONFLICTING":
+        return "conflict"
+    if pr["checks"] == "red":
+        return "ci-red"
+    if pr["checks"] == "pending" or pr["mergeable"] not in ("MERGEABLE",):
+        return "pending"
+    return "merge-ready"
+
+
+def default_author():
+    slug = os.environ.get("AUTOPILOT_GITHUB_APP_SLUG")
+    if not slug:
+        try:
+            r = subprocess.run(["security", "find-generic-password", "-s", "autopilot-github", "-a", "app-slug", "-w"],
+                               capture_output=True, text=True, timeout=10)
+            slug = r.stdout.strip() if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            slug = ""
+    return f"app/{slug or DEFAULT_APP_SLUG}"
+
+
+def open_prs(repos, author, gh=run_gh):
+    author = author or default_author()
+    prs, base_shas = [], {}
+    for repo in repos:
+        rows = json.loads(gh(["pr", "list", "-R", repo, "--state", "open", "--author", author,
+                              "--limit", "50", "--json", PR_FIELDS]) or "[]")
+        for r in rows:
+            checks, failing = checks_state(r.get("statusCheckRollup"))
+            m = PART_OF.search(r.get("body") or "")
+            base = r.get("baseRefName") or ""
+            key = (repo, base)
+            if key not in base_shas:
+                base_shas[key] = gh(["api", f"repos/{repo}/commits/{base}", "--jq", ".sha"]).strip()
+            prs.append({
+                "repo": repo, "number": r["number"], "url": r.get("url"), "title": r.get("title"),
+                "issue": m.group(1) if m else None, "branch": r.get("headRefName"),
+                "head": r.get("headRefOid"), "base": base, "base_sha": base_shas[key],
+                "draft": bool(r.get("isDraft")), "mergeable": (r.get("mergeable") or "UNKNOWN").upper(),
+                "checks": checks, "failing": failing, "createdAt": r.get("createdAt") or "",
+                "files": sorted(f.get("path") for f in (r.get("files") or []) if f.get("path")),
+            })
+    return prs
+
+
+def _lock_path(name):
+    return os.path.join(STATE_DIR, "locks", f"{name}.lock")
+
+
+def _fresh(path, now):
+    try:
+        return now - os.stat(path).st_mtime < LOCK_STALE_S
+    except OSError:
+        return False
+
+
+def _create(path, token):
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(f"token={token} at={_stamp(_now())}\n")
+    return True
+
+
+def _excl(path, token, now):
+    """Create `path` atomically for `token`; take it over when stale. True when this call holds it.
+
+    A takeover goes through a `.takeover` marker (O_EXCL too), so of two runs that both see the
+    same stale lock only one removes it, re-checking it's still stale; the other backs off."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if _create(path, token):
+        return True
+    if _fresh(path, now):
+        return False
+    marker = path + ".takeover"
+    try:
+        if now - os.stat(marker).st_mtime > TAKEOVER_STALE_S:
+            os.remove(marker)
+    except OSError:
+        pass
+    if not _create(marker, token):
+        return False  # someone else is taking it over
+    try:
+        if os.path.exists(path) and _fresh(path, now):
+            return False  # taken over meanwhile
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return _create(path, token)
+    finally:
+        try:
+            os.remove(marker)
+        except FileNotFoundError:
+            pass
+
+
+def _owner(path):
+    try:
+        m = re.search(r"token=(\S+)", open(path).read())
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def _check_owner(path, token):
+    if not os.path.exists(path):
+        raise SystemExit(f"{os.path.basename(path)}: not held (lost to a stale takeover?)")
+    if not token or _owner(path) != token:
+        raise SystemExit(f"{os.path.basename(path)}: held by another run, not yours")
+
+
+def lock(name, wait=0, now=None, sleep=None, touch=False, token=None):
+    import time as _t
+    if not LOCK_NAME.match(name):
+        raise SystemExit(f"not a lock name: {name}")
+    if touch:
+        _check_owner(_lock_path(name), token)
+        os.utime(_lock_path(name))
+        return {"locked": True, "name": name, "token": token}
+    token = secrets.token_hex(6)
+    deadline = (now or _t.time)() + wait
+    while True:
+        t = (now or _t.time)()
+        if _excl(_lock_path(name), token, t):
+            return {"locked": True, "name": name, "token": token}
+        if t >= deadline:
+            try:
+                holder = open(_lock_path(name)).read().strip()
+            except OSError:
+                holder = None
+            return {"locked": False, "name": name, "holder": holder}
+        (sleep or _t.sleep)(min(15, max(1, deadline - t)))
+
+
+def unlock(name, token):
+    if not os.path.exists(_lock_path(name)):
+        return {"unlocked": None}
+    _check_owner(_lock_path(name), token)
+    os.remove(_lock_path(name))
+    return {"unlocked": name}
+
+
+def locked_issues(now=None):
+    import time as _t
+    t = now or _t.time()
+    d = os.path.join(STATE_DIR, "locks")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return set()
+    return {n[:-5] for n in names if n.endswith(".lock") and ISSUE_ID.match(n[:-5]) and _fresh(os.path.join(d, n), t)}
+
+
+def _slot_path(n):
+    return os.path.join(STATE_DIR, "slots", f"{n}.lock")
+
+
+def slot(action, n=None, now=None, token=None, agent=None):
+    import time as _t
+    t = now or _t.time()
+    if action == "take":
+        token = secrets.token_hex(6)
+        for i in range(1, MAX_RUNS + 1):
+            if _excl(_slot_path(i), token, t):
+                return {"slot": i, "token": token, "max": MAX_RUNS, **({"agent": agent} if agent else {})}
+        return {"slot": None, "max": MAX_RUNS}
+    if action == "busy":
+        return sum(1 for i in range(1, MAX_RUNS + 1) if _fresh(_slot_path(i), t))
+    _check_owner(_slot_path(n), token)
+    if action == "touch":
+        os.utime(_slot_path(n))
+        return {"slot": n}
+    os.remove(_slot_path(n))
+    return {"released": n}
+
+
+def fingerprint(prs):
+    """What a run could react to: PR heads, base branches and check outcomes."""
+    keys = ("repo", "number", "head", "base_sha", "checks", "failing", "draft", "mergeable")
+    return sorted(({k: p[k] for k in keys} for p in prs), key=lambda f: (f["repo"], f["number"]))
+
+
+def waiting_path(ident):
+    return os.path.join(STATE_DIR, "waiting", f"{ident}.json")
+
+
+def write_waiting(ident, rec):
+    os.makedirs(os.path.dirname(waiting_path(ident)), exist_ok=True)
+    tmp = waiting_path(ident) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=2)
+    os.replace(tmp, waiting_path(ident))
+
+
+def read_waiting(ident):
+    try:
+        with open(waiting_path(ident)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def list_waiting():
+    d = os.path.join(STATE_DIR, "waiting")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    return [n[:-5] for n in names if n.endswith(".json") and ISSUE_ID.match(n[:-5])]
+
+
+def classify(issue, prs, waiting, pending_since=None, now=None, claimed=False):
+    status = min((pr_status(p) for p in prs), key=STATUS_RANK.__getitem__)
+    item = {"issue": issue, "status": status, "action": None, "actionable": False, "reason": "",
+            "stalled": False, "claimed": claimed,
+            "prs": sorted(prs, key=lambda p: (p["repo"], p["number"])), "waiting": waiting}
+    retries = (waiting or {}).get("auto_retries", 0)
+    if claimed:
+        item["reason"] = "a run is working on it now"
+    elif status == "held-draft":
+        item["reason"] = "a PR is in draft: the owner's hold"
+    elif status == "pending":
+        item["reason"] = "checks still running or mergeability unknown"
+        if pending_since and (now or _now()) - _parse(pending_since) >= datetime.timedelta(hours=STALL_HOURS):
+            item["stalled"] = True
+            item["reason"] = f"checks pending since {pending_since}: stuck?"
+    elif waiting and waiting.get("kind") == "claude" and os.environ.get("AUTOPILOT_FALLBACK") == "1":
+        item["reason"] = "waits for a Claude run (API mode can't do this step)"
+    elif waiting and waiting.get("kind") in ("owner", "slot"):
+        item["reason"] = "blocked, waiting for the owner's reply"
+    elif retries >= AUTO_RETRY_CAP:
+        item["stalled"] = True
+        item["reason"] = f"resumed {retries} times without the owner and still blocked: needs the owner"
+    elif waiting and waiting.get("fingerprint") == fingerprint(prs):
+        item["reason"] = "blocked, and nothing changed since (same heads, base and checks)"
+    else:
+        item["action"] = ACTION[status]
+        item["actionable"] = True
+        item["reason"] = ("blocker may have cleared: something changed since the block"
+                          if waiting else f"{status}: Autopilot can {ACTION[status]} it")
+    return item
+
+
+def _pending_seen(items_status, now):
+    """When each issue was first seen pending (kept in $STATE/inflight-seen.json)."""
+    path = os.path.join(STATE_DIR, "inflight-seen.json")
+    try:
+        with open(path) as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = {}
+    out = {k: seen[k] if k in seen else _stamp(now) for k, st in items_status.items() if st == "pending"}
+    if out != seen:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(out, f)
+        os.replace(path + ".tmp", path)
+    return out
+
+
+def sweep(repos=None, author=None, gh=run_gh, now=None):
+    now = now or _now()
+    repos = configured_repos() if repos is None else repos
+    prs = open_prs(repos, author, gh)
+    open_keys = {f"{p['repo']}#{p['number']}" for p in prs}
+    groups = {}
+    for p in prs:
+        groups.setdefault(p["issue"] or f"{p['repo']}#{p['number']}", []).append(p)
+    statuses = {k: min((pr_status(p) for p in g), key=STATUS_RANK.__getitem__) for k, g in groups.items()}
+    pending_since = _pending_seen(statuses, now)
+    # A block whose PRs are all gone (merged or closed, maybe by the owner) is over. Only judge
+    # blocks whose PRs all live in the repos swept now (a run may skip a broken-preprod project).
+    swept = set(repos)
+    for ident in list_waiting():
+        w = read_waiting(ident) or {}
+        recorded = w.get("prs") or []
+        if recorded and all(k.rsplit("#", 1)[0] in swept for k in recorded) and not open_keys.intersection(recorded):
+            clear(ident)
+    running = locked_issues(now.timestamp())
+    items = []
+    for key, group in groups.items():
+        issue = key if ISSUE_ID.match(key) else None
+        w = read_waiting(issue) if issue else None
+        item = classify(issue, group, w, pending_since.get(key), now, claimed=issue in running)
+        if item["stalled"] and (w or {}).get("notified") == item["reason"]:
+            item["stalled"] = False  # the owner already knows
+        items.append(item)
+    oldest = lambda i: min(p["createdAt"] for p in i["prs"])
+    items.sort(key=lambda i: (0 if i["actionable"] else 1, ACTION_ORDER.get(i["action"], 9), oldest(i)))
+    nxt = next((i for i in items if i["actionable"] and i["issue"]), None)
+    in_flight_ids = {i["issue"] for i in items if i["issue"]}
+    waiting_no_pr = [{"issue": w, **(read_waiting(w) or {})} for w in list_waiting() if w not in in_flight_ids]
+    for w in waiting_no_pr:
+        w.pop("fingerprint", None)
+    # In flight: issues with open PRs, plus issues a run works on that have no PR yet.
+    busy = {i["issue"] or f"pr:{i['prs'][0]['repo']}#{i['prs'][0]['number']}" for i in items} | running
+    claude_run = os.environ.get("AUTOPILOT_FALLBACK") != "1"
+    deferred = sorted((w for w in waiting_no_pr if (w.get("kind") == "slot" or (w.get("kind") == "claude" and claude_run))
+                       and w["issue"] not in running
+                       and not busy.intersection(w.get("after") or [])),
+                      key=lambda w: w.get("since", ""))
+    capacity = max(0, MAX_RUNS - len(busy))
+    return {"capacity": capacity, "max_runs": MAX_RUNS, "slot_taken": capacity == 0, "next": nxt,
+            "deferred_next": deferred[0] if deferred and capacity else None,
+            "running": sorted(running),
+            "stalled": [i for i in items if i["stalled"]],
+            "inflight": items, "waiting_no_pr": waiting_no_pr}
+
+
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+PLUGIN_KEY = "autopilot@autopilot"
+
+
+def _version(text):
+    return tuple(int(x) for x in re.findall(r"\d+", text or "")[:3])
+
+
+def plugin_check(root=PLUGIN_ROOT, installed_file=None):
+    """Is a newer Autopilot installed than the one this run loaded? A run keeps the skills and
+    config rules it started with, so after an update it must hand over rather than finish on
+    old rules (the owner's bug report, 2026-10-20)."""
+    installed_file = installed_file or os.path.expanduser(
+        os.environ.get("AUTOPILOT_INSTALLED_PLUGINS", "~/.claude/plugins/installed_plugins.json"))
+    out = {"running": None, "installed": None, "stale": False}
+    try:
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+            out["running"] = json.load(f).get("version")
+        with open(installed_file) as f:
+            entries = json.load(f).get("plugins", {}).get(PLUGIN_KEY) or []
+        # Scheduled runs load the user-scope install; another project's install says nothing about it.
+        out["installed"] = next((e.get("version") for e in entries if e.get("scope") == "user"), None)
+    except (OSError, ValueError, AttributeError) as e:
+        out["error"] = str(e)
+        return out
+    out["stale"] = bool(out["installed"] and out["running"]
+                        and _version(out["installed"]) > _version(out["running"]))
+    return out
+
+
+def overlap(ident, files, repos=None, author=None, gh=run_gh):
+    """In-flight issues (other than `ident`) whose open PRs touch any of `files`."""
+    want = {f.strip("/") for f in files}
+    conflicts = {}
+    for p in open_prs(configured_repos() if repos is None else repos, author, gh):
+        if not p["issue"] or p["issue"] == ident:
+            continue
+        shared = sorted(want.intersection(p["files"]))
+        if shared:
+            c = conflicts.setdefault(p["issue"], {"issue": p["issue"], "prs": [], "files": []})
+            c["prs"].append(p["url"])
+            c["files"] = sorted(set(c["files"]) | set(shared))
+    return {"conflicts": sorted(conflicts.values(), key=lambda c: c["issue"])}
+
+
+def count(repos=None, author=None, gh=run_gh):
+    out = sweep(repos, author, gh)
+    return (1 if out["next"] else 0) + (1 if out["deferred_next"] else 0) + len(out["stalled"])
+
+
+def limit_path(ident):
+    return os.path.join(STATE_DIR, "limit-interrupted", f"{ident}.json")
+
+
+def interrupted(ident):
+    """How often an API outage (a usage limit above all) cut this issue's runs off."""
+    try:
+        with open(limit_path(ident)) as f:
+            rec = json.load(f)
+        return {"count": int(rec.get("count", 0)), "last": rec.get("last")}
+    except (OSError, ValueError, TypeError):
+        return {"count": 0, "last": None}
+
+
+def record_interruption(ident, error, message="", now=None):
+    """The StopFailure hook: a run of `ident` stopped on an API error, not on the issue."""
+    rec = interrupted(ident)
+    rec = {"count": rec["count"] + 1, "last": _stamp(now or _now()), "error": error, "message": message[:300]}
+    os.makedirs(os.path.dirname(limit_path(ident)), exist_ok=True)
+    tmp = limit_path(ident) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, limit_path(ident))
+    return rec
+
+
+def claim(ident, now=None):
+    """A run takes in-flight work back by itself: one more automatic retry, unless the last run
+    was cut off by a usage limit after the previous claim (that stop wasn't the issue's fault)."""
+    rec = read_waiting(ident) or {"kind": "inflight", "reason": "resumed by the sweep", "prs": [], "fingerprint": None}
+    cuts = interrupted(ident)["count"]
+    if cuts > rec.get("limit_cuts_seen", 0):
+        rec["limit_cuts_seen"] = cuts
+        rec["limit_resume"] = True
+    else:
+        rec["auto_retries"] = rec.get("auto_retries", 0) + 1
+        rec.pop("limit_resume", None)
+    rec["claimed"] = _stamp(now or _now())
+    write_waiting(ident, rec)
+    return rec
+
+
+def notified(ident, reason):
+    rec = read_waiting(ident) or {"kind": "inflight", "prs": [], "fingerprint": None}
+    rec["notified"] = reason
+    write_waiting(ident, rec)
+    return rec
+
+
+def wait(ident, kind, reason, repos=None, author=None, gh=run_gh, now=None, after=None):
+    prs = [p for p in open_prs(configured_repos() if repos is None else repos, author, gh) if p["issue"] == ident]
+    prev = read_waiting(ident) or {}
+    rec = {"kind": kind, "reason": reason, "since": _stamp(now or _now()),
+           "prs": [f"{p['repo']}#{p['number']}" for p in prs], "fingerprint": fingerprint(prs),
+           # Automatic resumes survive a new block; only `clear` (done, or the owner) resets them.
+           "auto_retries": prev.get("auto_retries", 0),
+           "limit_cuts_seen": prev.get("limit_cuts_seen", 0)}
+    if after:
+        rec["after"] = sorted(set(after))  # in-flight issues it must not run beside (same files, Linear ties)
+    write_waiting(ident, rec)
+    return rec
+
+
+def clear(ident):
+    try:
+        os.remove(limit_path(ident))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(waiting_path(ident))
+        return {"cleared": ident}
+    except FileNotFoundError:
+        return {"cleared": None}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="autopilot-inflight", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, hlp in (("sweep", "open Autopilot PRs by issue, and the one to work next"),
+                      ("count", "how many things a run should wake for (fast exit)")):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("--repo", action="append")
+        s.add_argument("--author")
+    w = sub.add_parser("wait", help="record a block and what it waits for")
+    w.add_argument("issue")
+    w.add_argument("--kind", choices=("owner", "checkable", "slot", "claude"), required=True)
+    w.add_argument("--reason", required=True)
+    w.add_argument("--repo", action="append")
+    w.add_argument("--author")
+    w.add_argument("--after", nargs="+", help="slot: in-flight issues it waits for (same files, Linear ties)")
+    sub.add_parser("interrupted", help="how often a usage limit cut this issue's runs off").add_argument("issue")
+    for name, hlp in (("clear", "forget a block and its retry count"),
+                      ("claim", "a run takes in-flight work back (counts a retry)")):
+        sub.add_parser(name, help=hlp).add_argument("issue")
+    n = sub.add_parser("notified", help="the owner was notified about this stall")
+    n.add_argument("issue")
+    n.add_argument("--reason", required=True)
+    sl = sub.add_parser("slot", help="a run's slot (one of MAX_RUNS)")
+    sl.add_argument("action", choices=("take", "touch", "release", "busy"))
+    sl.add_argument("n", nargs="?", type=int)
+    sl.add_argument("--token")
+    sl.add_argument("--agent", help="take: the scheduled task that started this run")
+    lk = sub.add_parser("lock", help="an exclusive lock: an issue id, verify or keepalive")
+    lk.add_argument("name")
+    lk.add_argument("--wait", type=int, default=0, help="seconds to wait for it")
+    lk.add_argument("--touch", action="store_true", help="refresh a lock you hold (needs --token)")
+    lk.add_argument("--token")
+    ul = sub.add_parser("unlock", help="release a lock you hold")
+    ul.add_argument("name")
+    ul.add_argument("--token", required=True)
+    ov = sub.add_parser("overlap", help="other in-flight issues whose PRs touch these files")
+    ov.add_argument("issue")
+    ov.add_argument("--files", nargs="+", required=True)
+    ov.add_argument("--repo", action="append")
+    sub.add_parser("plugin-check", help="was Autopilot updated after this run started?")
+    return p
+
+
+def run(argv, gh=run_gh):
+    args = build_parser().parse_args(argv)
+    if args.cmd in ("lock", "unlock") and not LOCK_NAME.match(args.name):
+        raise SystemExit(f"not a lock name: {args.name}")
+    if getattr(args, "issue", None) and not ISSUE_ID.match(args.issue):
+        raise SystemExit(f"not an issue id: {args.issue}")
+    if args.cmd == "sweep":
+        return sweep(args.repo, args.author, gh)
+    if args.cmd == "count":
+        return count(args.repo, args.author, gh)
+    if args.cmd == "wait":
+        return wait(args.issue, args.kind, args.reason, args.repo, args.author, gh, after=args.after)
+    if args.cmd == "claim":
+        return claim(args.issue)
+    if args.cmd == "notified":
+        return notified(args.issue, args.reason)
+    if args.cmd == "slot":
+        if args.action in ("touch", "release") and not args.n:
+            raise SystemExit(f"slot {args.action} needs the slot number")
+        if args.agent and not AGENT_NAME.match(args.agent):
+            raise SystemExit(f"not an agent name: {args.agent}")
+        return slot(args.action, args.n, token=args.token, agent=args.agent)
+    if args.cmd == "lock":
+        return lock(args.name, args.wait, touch=args.touch, token=args.token)
+    if args.cmd == "unlock":
+        return unlock(args.name, args.token)
+    if args.cmd == "overlap":
+        return overlap(args.issue, args.files, args.repo)
+    if args.cmd == "interrupted":
+        return interrupted(args.issue)
+    if args.cmd == "plugin-check":
+        return plugin_check()
+    return clear(args.issue)
+
+
+def main(argv=None):
+    try:
+        out = run(sys.argv[1:] if argv is None else argv)
+        print(out if isinstance(out, int) else json.dumps(out, indent=2))
+    except GhError as e:
+        print(f"autopilot-inflight: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

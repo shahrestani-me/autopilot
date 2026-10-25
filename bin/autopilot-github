@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""autopilot-github: GitHub as the Autopilot GitHub App, not as the owner.
+
+Mints a short-lived installation access token (RS256 JWT from the app's private key →
+POST /app/installations/<id>/access_tokens) and runs gh or git with it, so branches,
+commits, PRs, comments and merges show as "<app-slug>[bot]".
+
+Credentials come only from the macOS Keychain, service "autopilot-github" (stored by
+bin/autopilot-github-setup, see docs/setup.md):
+  app-id              the GitHub App's id (not secret)
+  app-slug            its slug: the bot is "<slug>[bot]" (not secret)
+  owner               the org it is installed on (not secret)
+  private-key         base64 of the app's private key (PKCS#8 DER)
+  installation-token  cached token (valid 1 h); this tool mints it and keeps its
+                      expiry in the item's comment
+  bot-user-id         the bot user's id, for the commit e-mail (not secret)
+The key and the tokens are never printed, logged, put on a command line or written to a
+file: `gh` and `git` get the token in their environment only.
+
+  autopilot-github auth-check        {"ok": true, "bot": ..., "repos": [...]}; exit 2 when not set up
+  autopilot-github identity          {"name": ..., "email": ...} for commits
+  autopilot-github gh <args...>      gh with GH_TOKEN = an installation token
+  autopilot-github git <args...>     git committing as the bot; push/fetch authenticate as the app
+
+Errors go to stderr with exit code 1 (2 for missing setup).
+"""
+
+import base64
+import calendar
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+import urllib.parse
+
+# Keychain, HTTP and TLS handling are shared with the Linear helper next to this file.
+_loader = importlib.machinery.SourceFileLoader("autopilot_linear", str(pathlib.Path(__file__).resolve().with_name("autopilot-linear")))
+_spec = importlib.util.spec_from_loader("autopilot_linear", _loader)
+apl = importlib.util.module_from_spec(_spec)
+_loader.exec_module(apl)
+
+SERVICE = "autopilot-github"
+API = "https://api.github.com"
+USER_AGENT = "autopilot-runner/0.5.0"
+TOKEN_MARGIN_S = 10 * 60  # GitHub's tokens live 1 h; never hand out one with less left
+JWT_LIFETIME_S = 9 * 60  # GitHub allows at most 10 min
+JWT_BACKDATE_S = 60  # clock drift
+# Installation tokens start with ghs_ (since 2026 a ~380-character JWT-like body, with . and -).
+# Anything else in the cache (a personal token stored by hand) would act as a human: never used.
+INSTALLATION_TOKEN_RE = re.compile(r"ghs_[A-Za-z0-9_.-]+")
+SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+# git subcommands that talk to the remote and need the token; nothing else gets it, so repo
+# hooks run by commit and friends never see it.
+NETWORK_GIT = {"push", "fetch", "pull", "ls-remote", "clone", "submodule", "remote"}
+# Reset every configured credential helper (osxkeychain would store the token), then answer
+# `get` from the environment only. `store` and `erase` do nothing.
+CREDENTIAL_HELPER = '!f() { test "$1" = get && echo username=x-access-token && echo "password=$AUTOPILOT_GIT_TOKEN"; }; f'
+# SSH remotes (origin is often git@github.com:...) would push with the owner's SSH
+# key and never ask the helper: rewrite them to HTTPS for this one command.
+SSH_REWRITES = ("git@github.com:", "ssh://git@github.com/")
+
+SetupError, LinearError, AuthError = apl.SetupError, apl.LinearError, apl.AuthError
+
+
+class GitHubError(LinearError):
+    pass
+
+
+# --------------------------------------------------------------------------
+# RS256 in the standard library: DER → RSA key → PKCS#1 v1.5 signature (unit-tested
+# against openssl).
+
+DIGESTINFO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def _der(buf, i=0):
+    """(tag, value bytes, next index) of the DER element at i."""
+    if i + 2 > len(buf):
+        raise ValueError("truncated DER")
+    tag, n = buf[i], buf[i + 1]
+    i += 2
+    if n & 0x80:
+        k = n & 0x7F
+        if not 0 < k <= 4:
+            raise ValueError("bad DER length")
+        n = int.from_bytes(buf[i:i + k], "big")
+        i += k
+    if i + n > len(buf):
+        raise ValueError("truncated DER")
+    return tag, buf[i:i + n], i + n
+
+
+def _der_children(body):
+    out, i = [], 0
+    while i < len(body):
+        tag, value, i = _der(body, i)
+        out.append((tag, value))
+    return out
+
+
+def rsa_key(der):
+    """An RSA private key from PKCS#8 or PKCS#1 DER: dict of n, e, d, p, q, dp, dq, qinv."""
+    tag, body, _ = _der(der)
+    items = _der_children(body) if tag == 0x30 else []
+    # PKCS#8: SEQ { INTEGER 0, SEQ { rsaEncryption, NULL }, OCTET STRING { PKCS#1 } }
+    if len(items) >= 3 and items[1][0] == 0x30 and items[2][0] == 0x04:
+        if b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01" not in items[1][1]:
+            raise ValueError("not an RSA key")
+        return rsa_key(items[2][1])
+    ints = [int.from_bytes(v, "big") for t, v in items if t == 0x02]
+    if len(ints) < 9 or ints[0] != 0:
+        raise ValueError("not an RSA private key")
+    return dict(zip(("n", "e", "d", "p", "q", "dp", "dq", "qinv"), ints[1:9]))
+
+
+def rsa_sign(key, message):
+    """RSASSA-PKCS1-v1_5 with SHA-256 (what RS256 means)."""
+    n = key["n"]
+    k = (n.bit_length() + 7) // 8
+    t = DIGESTINFO_SHA256 + hashlib.sha256(message).digest()
+    if k < len(t) + 11:
+        raise ValueError("RSA key too short")
+    m = int.from_bytes(b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t, "big")
+    # CRT, then check the result: a faulty CRT signature would leak the key.
+    s1, s2 = pow(m, key["dp"], key["p"]), pow(m, key["dq"], key["q"])
+    s = s2 + ((key["qinv"] * (s1 - s2)) % key["p"]) * key["q"]
+    if pow(s, key["e"], n) != m:
+        raise ValueError("RSA signature self-check failed")
+    return s.to_bytes(k, "big")
+
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_jwt(app_id, key, now):
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = {"iat": int(now) - JWT_BACKDATE_S, "exp": int(now) + JWT_LIFETIME_S, "iss": str(app_id)}
+    payload = b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    return f"{header}.{payload}.{b64url(rsa_sign(key, signing_input))}"
+
+
+def decode_private_key(stored):
+    """The Keychain value: base64 DER, or a PEM pasted whole. Never echoed in errors."""
+    text = re.sub(r"-----(BEGIN|END) [A-Z ]+-----", "", stored or "")
+    try:
+        return rsa_key(base64.b64decode("".join(text.split()), validate=True))
+    except (ValueError, base64.binascii.Error):
+        raise SetupError("Keychain autopilot-github/private-key is not a readable RSA key. Re-run bin/autopilot-github-setup key.") from None
+
+
+# --------------------------------------------------------------------------
+# Client
+
+
+class GitHubApp:
+    def __init__(self, keychain=None, request=apl.http_request, now=time.time):
+        self.kc = keychain or apl.Keychain(service=SERVICE)
+        self.request = request
+        self.now = now
+        self._token = None
+        self.token_source = None
+
+    def _setting(self, account):
+        v = self.kc.get(account)
+        if not v:
+            raise SetupError(f"Keychain has no {SERVICE}/{account}. Follow docs/setup.md (GitHub App).")
+        return v
+
+    def slug(self):
+        s = self._setting("app-slug")
+        if not SLUG_RE.fullmatch(s):
+            raise SetupError(f"Keychain {SERVICE}/app-slug is not a GitHub App slug")
+        return s
+
+    def _call(self, method, path, token, scheme="token", body=None):
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"{scheme} {token}",
+            "User-Agent": USER_AGENT,
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        status, out = self.request(method, API + path, data, headers)
+        if status == 0:
+            raise GitHubError(f"network error: GitHub unreachable ({apl._net_reason(out)})")
+        if status in (401, 403):
+            msg = out.get("message") if isinstance(out, dict) else None
+            raise AuthError(f"GitHub refused {method} {path} (HTTP {status}): {msg or 'no details'}")
+        if status == 404:
+            raise GitHubError(f"GitHub {method} {path}: not found (is the app installed there?)")
+        if not 200 <= status < 300:
+            msg = out.get("message") if isinstance(out, dict) else None
+            raise GitHubError(f"GitHub {method} {path} failed (HTTP {status}): {msg or 'no details'}")
+        return out
+
+    def _mint(self):
+        app_id = self._setting("app-id")
+        owner = self._setting("owner")
+        jwt = app_jwt(app_id, decode_private_key(self._setting("private-key")), self.now())
+        inst = self._call("GET", f"/orgs/{urllib.parse.quote(owner)}/installation", jwt, scheme="Bearer")
+        out = self._call("POST", f"/app/installations/{int(inst['id'])}/access_tokens", jwt, scheme="Bearer")
+        token = out.get("token") if isinstance(out, dict) else None
+        if not token or not INSTALLATION_TOKEN_RE.fullmatch(token):
+            raise GitHubError("GitHub answered without an installation token")
+        exp = int(self.now()) + 3600
+        m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)", str(out.get("expires_at") or ""))
+        if m:
+            exp = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ"))
+        try:
+            self.kc.set("installation-token", token, f"exp={exp}")
+        except LinearError as e:
+            print(f"autopilot-github: warning: token not cached: {e}", file=sys.stderr)
+        self.token_source = "minted"
+        return token
+
+    def token(self):
+        if self._token:
+            return self._token
+        cached = self.kc.get("installation-token")
+        m = re.fullmatch(r"exp=(\d+)", self.kc.get_comment("installation-token") or "")
+        if cached and INSTALLATION_TOKEN_RE.fullmatch(cached) and m and int(m.group(1)) - self.now() > TOKEN_MARGIN_S:
+            self._token, self.token_source = cached, "cached"
+        else:
+            self._token = self._mint()
+        return self._token
+
+    def identity(self):
+        slug = self.slug()
+        uid = self.kc.get("bot-user-id")
+        if not (uid and uid.isdigit()):
+            user = self._call("GET", f"/users/{urllib.parse.quote(slug + '[bot]')}", self.token())
+            uid = str(int(user["id"]))
+            try:
+                self.kc.set("bot-user-id", uid, "")
+            except LinearError:
+                pass
+        name = f"{slug}[bot]"
+        return {"name": name, "email": f"{uid}+{name}@users.noreply.github.com"}
+
+    def auth_check(self):
+        token = self.token()
+        repos = self._call("GET", "/installation/repositories?per_page=100", token)
+        return {
+            "ok": True,
+            "bot": self.identity()["name"],
+            "repos": sorted(r["full_name"] for r in repos.get("repositories", [])),
+            "tokenSource": self.token_source,
+        }
+
+
+# --------------------------------------------------------------------------
+# gh / git wrappers (pure parts unit-tested)
+
+
+def clean_env(base):
+    """The caller's environment minus any GitHub credentials it already carries."""
+    return {k: v for k, v in base.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "AUTOPILOT_GIT_TOKEN")}
+
+
+def gh_command(args, token, base_env):
+    env = clean_env(base_env)
+    env.update({"GH_TOKEN": token, "GH_PROMPT_DISABLED": "1", "GH_HOST": "github.com"})
+    return ["gh", *args], env
+
+
+def git_subcommand(args):
+    """The git subcommand, skipping global options like -C <dir> and -c k=v."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            i += 2
+        elif a.startswith("-"):
+            i += 1
+        else:
+            return a
+    return None
+
+
+def git_command(args, ident, token, base_env):
+    env = clean_env(base_env)
+    env.update({
+        "GIT_AUTHOR_NAME": ident["name"], "GIT_AUTHOR_EMAIL": ident["email"],
+        "GIT_COMMITTER_NAME": ident["name"], "GIT_COMMITTER_EMAIL": ident["email"],
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    cmd = ["git"]
+    if token is not None:
+        env["AUTOPILOT_GIT_TOKEN"] = token
+        cmd += ["-c", "credential.helper=", "-c", f"credential.helper={CREDENTIAL_HELPER}"]
+        for prefix in SSH_REWRITES:
+            cmd += ["-c", f"url.https://github.com/.insteadOf={prefix}"]
+    return cmd + list(args), env
+
+
+def run(argv, app=None, execvpe=os.execvpe, environ=None):
+    environ = os.environ if environ is None else environ
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.split("\n\n")[-2])
+        return None
+    app = app or GitHubApp()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "auth-check":
+        return app.auth_check()
+    if cmd == "identity":
+        return app.identity()
+    if cmd == "gh":
+        return execvpe("gh", *gh_command(rest, app.token(), environ))  # never returns
+    if cmd == "git":
+        needs_token = git_subcommand(rest) in NETWORK_GIT
+        args, env = git_command(rest, app.identity(), app.token() if needs_token else None, environ)
+        return execvpe("git", args, env)
+    raise GitHubError(f"unknown command {cmd}")
+
+
+def main(argv=None):
+    try:
+        out = run(sys.argv[1:] if argv is None else argv)
+    except SetupError as e:
+        print(f"autopilot-github: setup needed: {e}", file=sys.stderr)
+        return 2
+    except LinearError as e:
+        print(f"autopilot-github: {e}", file=sys.stderr)
+        return 1
+    if out is not None:
+        print(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

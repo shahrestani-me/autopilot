@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""autopilot-runstate: let Autopilot carry on by itself after a Claude usage limit.
+
+A Claude Code hook (hooks/hooks.json) runs this with the hook's JSON on stdin.
+
+PostToolUse (Bash): remembers what this Claude session holds, read from the helpers' output:
+`slot take` ({"slot": N, "token": T}, with "agent" when the scheduled task named itself), an issue
+lock ({"locked": true, "name": "ENG-1", "token": T}), and forgets them on `slot release`
+({"released": N}) and `unlock` ({"unlocked": "ENG-1"}). bin/autopilot-stream reads "agent" from
+here to say in the issue's Linear session which agent ran it.
+Unlike the stream state, a plain Stop doesn't clear this: unattended runs go idle between
+background tasks and still hold their locks.
+
+StopFailure: the turn ended on an API error. For a usage limit or another outage
+(OUTAGE_ERRORS) the run is cut off through no fault of the issue, and nobody will resume this
+session. So it:
+  - records the interruption (`autopilot-inflight interrupted <ID>`): it doesn't count as an
+    attempt, so the issue isn't handed to the owner for it;
+  - releases the issue lock and the slot, so the first run after the reset takes the issue back
+    at once instead of waiting LOCK_STALE_S for them to go stale;
+  - posts a thought in the issue's Linear session, as Autopilot, naming the agent that ran it.
+Other errors (an invalid request, max output tokens) may be the issue's own doing: left alone, so
+the attempt cap still catches an issue whose runs keep failing.
+A usage limit in a Claude session (not an API-mode run) also switches Autopilot to API mode
+(bin/autopilot-fallback `limited` + `start`), whether or not the session held anything: a scheduled
+run that fails on its first turn holds nothing yet. A Claude session's next Bash call means Claude
+works again and clears the limit.
+
+It never fails the run: errors go to $STATE/runstate.log and the hook exits 0.
+
+State: $AUTOPILOT_STATE_DIR (default ~/.local/state/autopilot)/runs/<claude session id>.json
+       {"slot": N, "slot_token": T, "agent": "autopilot-agent-2", "issue": "ENG-1", "issue_token": T}
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import traceback
+
+STATE_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_STATE_DIR", "~/.local/state/autopilot"))
+BIN = os.path.dirname(os.path.realpath(__file__))
+ISSUE_ID = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# A usage limit arrives as rate_limit; the others are outages too: nothing in the issue causes them.
+OUTAGE_ERRORS = {"rate_limit", "overloaded", "server_error", "billing_error"}
+# Only these mean the subscription is out (an overload or a server error passes by itself): API mode.
+LIMIT_ERRORS = {"rate_limit", "billing_error"}
+# How a usage limit maps to `error` isn't documented: an `unknown` one that talks about limits counts too.
+LIMIT_TEXT = re.compile(r"(?i)\b(usage|rate|plan)\s+limit|limit\s+reached|hit your limit|resets?\b")
+# API mode needs the subscription's own wording: a bare "reset" (connection reset) isn't a limit.
+SUBSCRIPTION_LIMIT_TEXT = re.compile(r"(?i)\b(usage|plan|session|weekly)\s+limit|limit\s+reached|hit your limit|limit\s+(will\s+)?resets?\b")
+AGENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# The scheduled tasks from docs/setup.md: "autopilot-agent" is agent 1, "autopilot-agent-N" agent N.
+AGENT_NUMBER = re.compile(r"^autopilot-agent(?:-(\d+))?$")
+
+
+def _load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def run_by(agent):
+    """How the issue's Linear session names the agent that ran: "Run by Agent 2 (`autopilot-agent-2`)"."""
+    if not isinstance(agent, str) or not AGENT_NAME.match(agent):
+        return "Manual run (no scheduled agent)"
+    m = AGENT_NUMBER.match(agent)
+    return f"Run by Agent {m.group(1) or 1} (`{agent}`)" if m else f"Run by `{agent}`"
+
+
+def _path(session_id):
+    return os.path.join(STATE_DIR, "runs", f"{session_id}.json")
+
+
+def read(session_id):
+    try:
+        with open(_path(session_id)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def prune(now=None, max_age_s=2 * 86400):
+    """Forget records of runs that ended some other way (a crash, a kill) days ago."""
+    import time
+    d, now = os.path.join(STATE_DIR, "runs"), now or time.time()
+    for name in os.listdir(d) if os.path.isdir(d) else []:
+        try:
+            if now - os.stat(os.path.join(d, name)).st_mtime > max_age_s:
+                os.remove(os.path.join(d, name))
+        except OSError:
+            pass
+
+
+def write(session_id, rec):
+    path = _path(session_id)
+    if not rec:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+
+
+def objects(tool_response):
+    """Every JSON object printed in a Bash call's output (a run may chain several helper calls)."""
+    out = tool_response.get("stdout") if isinstance(tool_response, dict) else str(tool_response or "")
+    out, dec, i = out or "", json.JSONDecoder(), 0
+    while True:
+        i = out.find("{", i)
+        if i < 0:
+            return
+        try:
+            obj, end = dec.raw_decode(out, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        i = end
+
+
+def track(session_id, tool_response):
+    """PostToolUse on Bash: update what this session holds. Returns the record."""
+    rec = read(session_id)
+    before = dict(rec)
+    for obj in objects(tool_response):
+        if isinstance(obj.get("slot"), int) and obj.get("token"):
+            rec.update(slot=obj["slot"], slot_token=obj["token"])
+            rec.pop("agent", None)
+            if AGENT_NAME.match(str(obj.get("agent") or "")):
+                rec["agent"] = obj["agent"]
+        elif obj.get("locked") is True and ISSUE_ID.match(str(obj.get("name") or "")) and obj.get("token"):
+            rec.update(issue=obj["name"], issue_token=obj["token"])
+        elif "released" in obj and obj.get("released") == rec.get("slot"):
+            rec.pop("slot", None), rec.pop("slot_token", None), rec.pop("agent", None)
+        elif obj.get("unlocked") and obj.get("unlocked") == rec.get("issue"):
+            rec.pop("issue", None), rec.pop("issue_token", None)
+    if rec != before:
+        write(session_id, rec)
+        if rec.get("slot") and not before.get("slot"):
+            prune()  # a new run started: a good moment to drop old leftovers
+    return rec
+
+
+def on_failure(session_id, event, inflight=None, post=None):
+    """StopFailure: an outage cut the run off. Returns what it did (for tests)."""
+    error = str(event.get("error") or "")
+    message = str(event.get("last_assistant_message") or event.get("error_details") or error)
+    rec = read(session_id)
+    outage = error in OUTAGE_ERRORS or (error == "unknown" and LIMIT_TEXT.search(message))
+    if not outage or not rec:
+        return {"skipped": error or "no error"}
+    inflight = inflight or _load("autopilot-inflight")
+    done = {"error": error}
+    issue = rec.get("issue")
+    if issue:
+        done["interrupted"] = inflight.record_interruption(issue, error, message)
+        try:
+            inflight.unlock(issue, rec.get("issue_token"))
+            done["unlocked"] = issue
+        except SystemExit as e:  # already taken over by another run: nothing of ours to free
+            done["unlock_error"] = str(e)
+    if rec.get("slot"):
+        try:
+            inflight.slot("release", rec["slot"], token=rec.get("slot_token"))
+            done["released"] = rec["slot"]
+        except SystemExit as e:
+            done["release_error"] = str(e)
+    write(session_id, {})
+    if issue and post:
+        try:
+            post(issue, {"type": "thought", "body": (
+                f"Paused: Claude stopped this run ({message[:200]}). {run_by(rec.get('agent'))}. That's a usage limit or an outage, "
+                "not a problem with the issue. What was pushed is kept on the branch and PR (unpushed "
+                "edits may be redone), and the issue is free again: the first run after the limit resets "
+                "carries on from there.")})
+            done["posted"] = True
+        except Exception:
+            _log()
+    return done
+
+
+def is_limit(event):
+    error = str(event.get("error") or "")
+    message = str(event.get("last_assistant_message") or event.get("error_details") or error)
+    return error in LIMIT_ERRORS or (error == "unknown" and bool(SUBSCRIPTION_LIMIT_TEXT.search(message)))
+
+
+def in_api_mode_run(env=os.environ):
+    return env.get("AUTOPILOT_FALLBACK") == "1"
+
+
+CLEAR_AFTER_S = 600  # a limit younger than this may still be landing on other sessions
+
+
+def clear_limit(now=None):
+    """A Claude session ran a command: the subscription works. A flag set in the last minutes
+    stays: another session may just not have reached the limit yet."""
+    import time
+    path = os.path.join(STATE_DIR, "claude-limited")
+    try:
+        if (now or time.time()) - os.stat(path).st_mtime >= CLEAR_AFTER_S:
+            os.remove(path)
+            return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def switch_to_api_mode(run=subprocess.run):
+    """Claude's limit: record it and start the fallback supervisor (it returns at once)."""
+    fb = os.path.join(BIN, "autopilot-fallback")
+    run([fb, "limited"], capture_output=True, timeout=5)
+    return run([fb, "start", "--reason", "Claude usage limit"], capture_output=True, text=True, timeout=8)
+
+
+def _post_via_linear():
+    apl = _load("autopilot-linear")
+    lin = apl.Linear(expect_session=apl.expect_own_session(apl.Gateway()))
+
+    def post(issue, content):
+        cur = apl.read_current_job(issue)
+        target = (cur or {}).get("sessionId") or lin.ensure_session(issue)
+        lin.activity(issue, content, False, target)
+    return post
+
+
+def _log():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "runstate.log")
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            os.replace(path, path + ".1")
+        with open(path, "a") as f:
+            f.write(traceback.format_exc() + "\n")
+    except OSError:
+        pass
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+        sid = event.get("session_id") or ""
+        if not SESSION_ID.match(sid):
+            return 0
+        kind = event.get("hook_event_name")
+        if kind == "PostToolUse" and event.get("tool_name") == "Bash" and not in_api_mode_run():
+            clear_limit()
+        if kind == "PostToolUse" and event.get("tool_name") == "Bash":
+            stdout = json.dumps(event.get("tool_response") or "")
+            if '"token' in stdout or 'released' in stdout or 'unlocked' in stdout:  # cheap: most calls aren't helpers
+                track(sid, event.get("tool_response"))
+        elif kind == "StopFailure":
+            if is_limit(event) and not in_api_mode_run():
+                try:
+                    switch_to_api_mode()  # first: a slow or failing Linear post must not hold it up
+                except Exception:
+                    _log()
+            if read(sid):
+                on_failure(sid, event, post=_post_via_linear())
+    except Exception:
+        _log()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

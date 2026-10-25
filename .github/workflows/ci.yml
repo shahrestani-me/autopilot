@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new commit pushed to a PR (`synchronize`) cancels the run still working on
+# the previous commit, so a cancelled run only ever sits on an older commit.
+# Other PR events on the same commit (reopened, ready_for_review, ...) queue
+# behind the running job instead, and runs on main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml jsonschema graphql-core
+      - name: Unit, config-schema and Linear GraphQL contract tests
+        run: python -m unittest discover -s tests -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Gateway Worker tests
+        working-directory: gateway
+        run: npm test
+      - name: Plugin manifests are valid JSON
+        run: python -c "import json; [json.load(open(p)) for p in ('.claude-plugin/plugin.json', '.claude-plugin/marketplace.json')]"

@@ -1,0 +1,32 @@
+# Sandbox: smoke tests of the Autopilot identity, in Linear and on GitHub.
+# Linear-only tickets (answer, summarize, triage) need no repo; tickets that ask for a change use
+# example-org/autopilot-sandbox, a private repo where nothing real lives (end-to-end tests of
+# the GitHub App: app-authored PRs, @claude-autopilot mentions on them).
+version: 1
+name: sandbox
+description: Smoke tests for the Autopilot agent. Nothing here touches real code or any environment.
+
+linear:
+  team: ENG
+  projects: ["Autopilot Sandbox"]
+  states:
+    in_progress: In Progress
+    done: Done
+
+repos:
+  - name: autopilot-sandbox
+    github: example-org/autopilot-sandbox
+    path: ~/src/autopilot-sandbox
+    role: sandbox (Markdown only; CI checks every .md file starts with a heading)
+    checks:
+      - "for f in $(git -C $WT ls-files '*.md'); do head -1 $WT/$f | grep -q '^# ' || echo \"$f has no heading\"; done"
+
+git:
+  branch_prefix: autopilot/
+
+merge:
+  policy: merge-all
+  code_review: low
+
+spend:
+  paid_model_usd_per_ticket: 0

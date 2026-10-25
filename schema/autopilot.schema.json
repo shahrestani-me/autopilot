@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/shahrestani-me/autopilot/schema/autopilot.schema.json",
+  "title": "autopilot.yaml",
+  "description": "Per-project configuration for the Autopilot runner. One file per Linear project, kept in ~/.config/autopilot/projects/<name>.yaml (or the project's main repo). It holds no secrets.",
+  "type": "object",
+  "required": ["version", "name", "linear"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Short slug; used for state files and report headings."
+    },
+    "description": { "type": "string" },
+    "linear": {
+      "type": "object",
+      "required": ["team", "projects"],
+      "additionalProperties": false,
+      "properties": {
+        "team": { "type": "string", "description": "Team key, e.g. ENG." },
+        "projects": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Linear project names this config covers. Issues delegated to Autopilot in other projects are not worked."
+        },
+        "states": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Workflow state names; each may also be a state type (started, completed, ...).",
+          "properties": {
+            "in_progress": { "type": "string", "default": "In Progress" },
+            "merged": { "type": "string", "default": "In Review", "description": "Merged, verifying on preprod." },
+            "waiting": { "type": "string", "default": "Todo", "description": "Waiting for something that clears by itself (a check, another ticket). Never a started state." },
+            "blocked": { "type": "string", "default": "Blocked", "description": "Waiting for the owner's answer (wait: owner): the issue shows as Blocked and the owner is @mentioned in a top-level comment. An unstarted-type state; falls back to waiting if the team lacks it." },
+            "done": { "type": "string", "default": "Done" }
+          }
+        },
+        "followup_state": {
+          "type": "string",
+          "default": "Backlog",
+          "description": "Where follow-up tickets the worker files go. Never a state that Autopilot works from."
+        },
+        "release_checks_project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Linear project for owner-only checks left after an issue is Done on preprod (device QA, second-user, admin), gone through before a prod release. Without it the worker blocks on such checks."
+        },
+        "owner": {
+          "type": "string",
+          "description": "Linear name or email of the human who gets notices outside an issue (e.g. the preprod keep-alive's sign-in notice is assigned to them)."
+        }
+      }
+    },
+    "repos": {
+      "type": "array",
+      "default": [],
+      "description": "Repositories tickets may change. Empty = Linear-only tasks (answers, triage, docs in Linear).",
+      "items": {
+        "type": "object",
+        "required": ["name", "github", "path"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "github": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+          "path": { "type": "string", "description": "The shared checkout. Read-only for Autopilot: workers use git worktrees." },
+          "default_branch": { "type": "string", "default": "main" },
+          "role": { "type": "string", "description": "Free text, e.g. 'frontend (Expo/React Native PWA)'." },
+          "house_rules": { "type": "string", "description": "A file the worker reads before coding." },
+          "setup": { "type": "array", "items": { "type": "string" }, "description": "Commands that prepare a fresh worktree ($WT is the worktree)." },
+          "checks": { "type": "array", "items": { "type": "string" }, "description": "Local checks that must pass before a PR." },
+          "known_local_failures": { "type": "array", "items": { "type": "string" } },
+          "deploy_workflows": { "type": "array", "items": { "type": "string" }, "description": "Workflows that deploy preprod after a merge to the default branch." },
+          "ci_review": {
+            "type": "object",
+            "required": ["check", "approver"],
+            "additionalProperties": false,
+            "description": "The repo's CI runs the AI review: a check reviews every push and an account approves the head commit when it passes (or requests changes). With it, the worker runs no code-review or general reviewer rounds of its own on this repo. It fixes what the CI review flags and merges on that check plus that approval of the head, with no open review threads. The security reviewer still runs where the review table or a config note requires it.",
+            "properties": {
+              "check": { "type": "string", "description": "The CI check that runs the review, e.g. claude-review." },
+              "approver": { "type": "string", "description": "The login whose APPROVED review of the head commit is the AI approval, e.g. github-actions[bot]." },
+              "checks_attack_closed": { "type": "boolean", "default": false, "description": "The CI review also checks a PR's 'Attack closed' section (copied from the issue) and blocks when the attack isn't closed. Then the worker runs no security reviewer of its own on this repo." }
+            }
+          },
+          "notes": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branch_prefix": { "type": "string", "default": "autopilot/" },
+        "worktree_root": { "type": "string", "default": "~/.local/state/autopilot/worktrees" },
+        "ticket_id_in_branch_or_title": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep false: Linear auto-completes a ticket whose ID is in a merged PR's branch or title, before preprod verification."
+        }
+      }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {
+          "enum": ["merge-all", "hold-sensitive", "never"],
+          "default": "merge-all",
+          "description": "merge-all: merge every green, AI-reviewed PR. hold-sensitive: leave PRs touching hold_paths for the owner. never: open PRs only."
+        },
+        "hold_paths": { "type": "array", "items": { "type": "string" }, "description": "Globs that count as security/schema changes under hold-sensitive." },
+        "admin_on_missing_approval": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only without the Autopilot GitHub App (github: owner): allow `gh pr merge --admin` when the merge is refused for a missing approval (owner-authored PRs can't be self-approved). Never past a failing check. With the app, a missing approval blocks and asks the owner to approve."
+        },
+        "max_ci_cycles": { "type": "integer", "minimum": 1, "default": 3 },
+        "max_review_loops": { "type": "integer", "minimum": 1, "default": 3 },
+        "reviewer_model": { "type": "string", "default": "sonnet" },
+        "code_review": {
+          "enum": ["low", "medium", "high", "xhigh", "max", "off"],
+          "default": "high",
+          "description": "Effort for the Claude Code code-review skill run on every PR before the reviewer subagents. off: a correctness subagent instead. ultra is not allowed (billed, owner-triggered)."
+        }
+      }
+    },
+    "preprod": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where and how merged work is verified. Omit for projects with no preprod.",
+      "properties": {
+        "web_url": { "type": "string", "format": "uri" },
+        "api_hosts": { "type": "array", "items": { "type": "string" }, "description": "Hosts the preprod app must call; anything else means wrong environment." },
+        "browser": { "enum": ["chrome", "built-in"], "default": "chrome" },
+        "test_users": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "role": { "type": "string" },
+              "signed_in_where": { "type": "string", "description": "e.g. 'main Chrome profile' or 'owner, incognito'." }
+            }
+          }
+        },
+        "recipes": { "type": "array", "items": { "type": "string" }, "description": "Verification tips the worker follows." },
+        "keepalive": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": { "type": "string", "format": "uri" },
+            "every_hours": { "type": "number", "default": 20, "maximum": 20, "description": "The scheduled fast exit wakes a run after 20 h, so more than that is never honoured." },
+            "user": { "type": "string", "description": "The test user who must be signed in there (a test_users name)." },
+            "session_jwt_storage_key": {
+              "type": "string",
+              "description": "localStorage key of the session JWT. The keep-alive decodes only its exp claim, never prints or sends it."
+            },
+            "warn_hours": { "type": "number", "default": 24, "description": "File a sign-in notice when the session has less than this left." }
+          }
+        },
+        "known_fixes": {
+          "type": "array",
+          "description": "Mechanical owner steps the worker quotes exactly in an elicitation's 'What I need from you'.",
+          "items": {
+            "type": "object",
+            "required": ["when", "do"],
+            "additionalProperties": false,
+            "properties": {
+              "when": { "type": "string" },
+              "do": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "forbidden": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Hard no-prod rules. Phase 4 hooks enforce these; until then the skills state them.",
+      "properties": {
+        "hosts": { "type": "array", "items": { "type": "string" } },
+        "gcp_projects": { "type": "array", "items": { "type": "string" } },
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "mcp_servers": { "type": "array", "items": { "type": "string" } },
+        "workflows": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "coder": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The implementation step on a non-Claude model through OpenRouter (bin/autopilot-coder), only for an issue with a coder:<model> label or a 'Coder model:' line. Its cost counts against spend.paid_model_usd_per_ticket.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true, "description": "false: an issue that names a non-Claude model blocks and asks, instead of coding on it." },
+        "models": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9._:-]+$" },
+          "description": "Short names an issue may use, to OpenRouter model ids, e.g. deepseek: deepseek/deepseek-v4.1-flash. Other names are matched against OpenRouter's model list."
+        },
+        "timeout_min": { "type": "integer", "minimum": 5, "default": 60 }
+      }
+    },
+    "spend": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paid_model_usd_per_ticket": { "type": "number", "minimum": 0, "default": 1, "description": "Gemini/Vertex or other paid model spend a ticket may cause in total." },
+        "reference_costs": { "type": "object", "additionalProperties": { "type": "string" } },
+        "never": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "reports": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dir": { "type": "string", "default": "~/.local/state/autopilot/reports", "description": "Daily markdown reports, YYYY-MM-DD.md." }
+      }
+    }
+  }
+}

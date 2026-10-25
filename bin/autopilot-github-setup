@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""autopilot-github-setup: create the Autopilot GitHub App and store its secrets.
+
+The OWNER runs this in their own Terminal. Secrets travel from GitHub's API straight into
+the macOS Keychain (service autopilot-github, through `security -i` stdin) and from there
+into Cloudflare Worker secrets (through pipes); nothing is printed, put on a command line
+or written to a file. See docs/setup.md, "GitHub App".
+
+  bin/autopilot-github-setup create-app [--name NAME] [--org ORG]
+      Opens a page in the browser that sends GitHub the app manifest (name, permissions,
+      webhook). You review it and click "Create GitHub App"; GitHub sends you back here,
+      and the app id, slug, private key and webhook secret go into the Keychain.
+  bin/autopilot-github-setup worker-secrets
+      Copies the private key and webhook secret from the Keychain to the gateway Worker
+      (GITHUB_APP_PRIVATE_KEY, GITHUB_WEBHOOK_SECRET).
+"""
+
+import argparse
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import urllib.parse
+import webbrowser
+
+SERVICE = "autopilot-github"
+API = "https://api.github.com"
+WRANGLER = ["npx", "--yes", "wrangler@4.151.1"]
+HERE = os.path.dirname(os.path.realpath(__file__))
+KEYCHAIN_VALUE_RE = re.compile(r"[A-Za-z0-9+/=_.:-]+")
+
+# Every permission is explained in docs/setup.md; keep the two in step.
+PERMISSIONS = {
+    "contents": "write",        # push Autopilot's branches; squash-merge with --delete-branch
+    "pull_requests": "write",   # open, edit and merge PRs; read reviews and review comments
+    "issues": "write",          # PR conversation comments are issue comments: reply, react
+    "checks": "read",           # gh pr checks --watch
+    "actions": "read",          # gh run watch / view --log-failed (CI and the preprod deploy)
+    "workflows": "write",       # push changes under .github/workflows (owner: keep parity)
+    "metadata": "read",         # mandatory for every app
+}
+EVENTS = ["issue_comment", "pull_request_review", "pull_request_review_comment"]
+
+
+def manifest(name, port, org, gateway_url):
+    return {
+        "name": name,
+        "url": f"https://github.com/{org}",
+        "description": "Autopilot: works Linear issues delegated to it and opens PRs. Mention it on a PR to give it work.",
+        "hook_attributes": {"url": f"{gateway_url.rstrip('/')}/github", "active": True},
+        "redirect_url": f"http://127.0.0.1:{port}/callback",
+        "public": False,
+        "default_permissions": PERMISSIONS,
+        "default_events": EVENTS,
+    }
+
+
+def gateway_url(given=None):
+    """The gateway URL (--gateway-url, else what bin/autopilot-gateway-setup stored; not secret).
+    The app's webhook points at it."""
+    url = given
+    if not url:
+        r = subprocess.run(["security", "find-generic-password", "-s", "autopilot-gateway", "-a", "url", "-w"],
+                           capture_output=True, text=True)
+        url = r.stdout.strip() if r.returncode == 0 else ""
+    if not re.fullmatch(r"https://[A-Za-z0-9.-]+/?", url):
+        raise SystemExit("no gateway URL: run bin/autopilot-gateway-setup url <https://...> first, or pass --gateway-url")
+    return url
+
+
+def keychain_put(account, value):
+    if not KEYCHAIN_VALUE_RE.fullmatch(value):
+        raise SystemExit(f"refusing: unexpected characters in {account}")
+    cmd = f'add-generic-password -U -s {SERVICE} -a {account} -w "{value}"\n'
+    subprocess.run(["security", "-i"], input=cmd, text=True, capture_output=True, check=False)
+    got = subprocess.run(["security", "find-generic-password", "-s", SERVICE, "-a", account, "-w"],
+                         text=True, capture_output=True, check=False).stdout.rstrip("\n")
+    if got != value:
+        raise SystemExit(f"could not write {SERVICE}/{account} to the Keychain")
+
+
+def pkcs8_der_b64(pem):
+    """GitHub's PKCS#1 PEM → base64 PKCS#8 DER (one line; what WebCrypto and the helper read)."""
+    out = subprocess.run(["openssl", "pkcs8", "-topk8", "-nocrypt", "-outform", "DER"],
+                         input=pem.encode(), capture_output=True, check=False)
+    if out.returncode != 0 or not out.stdout:
+        raise SystemExit("openssl could not convert the app's private key")
+    import base64
+    return base64.b64encode(out.stdout).decode()
+
+
+def _linear_helper():
+    """bin/autopilot-linear as a module, for its TLS context (python.org builds ship without CAs)."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("autopilot_linear", os.path.join(HERE, "autopilot-linear"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("autopilot_linear", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def convert(code):
+    import urllib.request
+    req = urllib.request.Request(f"{API}/app-manifests/{urllib.parse.quote(code)}/conversions", data=b"", method="POST",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "autopilot-setup"})
+    with urllib.request.urlopen(req, timeout=30, context=_linear_helper().ssl_context()) as resp:
+        return json.loads(resp.read().decode())
+
+
+def store(app):
+    keychain_put("app-id", str(int(app["id"])))
+    keychain_put("app-slug", app["slug"])
+    keychain_put("owner", app["owner"]["login"])
+    keychain_put("private-key", pkcs8_der_b64(app["pem"]))
+    keychain_put("webhook-secret", app["webhook_secret"])
+    # client_id / client_secret are for user sign-in, which Autopilot never does: not kept.
+
+
+def create_app(name, org, gateway_url):
+    state = secrets.token_urlsafe(24)
+    done = threading.Event()
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):  # the callback URL carries the one-time code: keep it out of the terminal
+            pass
+
+        def _send(self, body):
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(url.query)
+            if url.path == "/":
+                target = f"https://github.com/organizations/{urllib.parse.quote(org)}/settings/apps/new?state={state}"
+                m = html.escape(json.dumps(manifest(name, self.server.server_port, org, gateway_url)))
+                self._send(f"""<!doctype html><meta charset="utf-8"><title>Create Autopilot GitHub App</title>
+<body style="font:16px system-ui;margin:3em"><p>Sending the Autopilot app manifest to GitHub...</p>
+<form id="f" method="post" action="{html.escape(target)}"><input type="hidden" name="manifest" value="{m}">
+<button>Continue to GitHub</button></form><script>document.getElementById('f').submit()</script>""")
+                return
+            if url.path == "/callback":
+                if q.get("state", [""])[0] != state or not q.get("code"):
+                    self._send("<p>Unexpected callback (state mismatch). Nothing was stored.</p>")
+                    return
+                try:
+                    app = convert(q["code"][0])
+                    store(app)
+                    result.update(id=app["id"], slug=app["slug"], owner=app["owner"]["login"])
+                    self._send(f"""<!doctype html><meta charset="utf-8"><body style="font:16px system-ui;margin:3em">
+<p>Created <b>{html.escape(app['slug'])}</b>; its secrets are in the Keychain.</p>
+<p>Next: <a href="https://github.com/apps/{html.escape(app['slug'])}/installations/new">install it</a> on the repos Autopilot works in.</p>""")
+                except BaseException as e:  # noqa: BLE001 - reported without details that could carry secrets
+                    result["error"] = type(e).__name__
+                    self._send("<p>Converting the manifest failed; see the terminal. Nothing secret was shown.</p>")
+                finally:
+                    done.set()
+                return
+            self.send_error(404)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    print(f"Opening {url} in your browser. Review the app on GitHub and click \"Create GitHub App\".")
+    webbrowser.open(url)
+    if not done.wait(timeout=1800):
+        raise SystemExit("timed out after 30 minutes; nothing stored")
+    srv.shutdown()
+    if "error" in result:
+        raise SystemExit(f"failed: {result['error']}")
+    print(f"Created GitHub App {result['slug']} (id {result['id']}) on {result['owner']}; Keychain {SERVICE}/* stored.")
+    print(f"Install it: https://github.com/apps/{result['slug']}/installations/new")
+    print("Then: bin/autopilot-github-setup worker-secrets")
+
+
+def worker_secrets():
+    token = subprocess.run(["security", "find-generic-password", "-s", "autopilot-cloudflare", "-a", "deploy-token", "-w"],
+                           capture_output=True, text=True, check=False)
+    if token.returncode != 0:
+        raise SystemExit("Keychain has no autopilot-cloudflare/deploy-token; see docs/gateway.md")
+    env = {**os.environ, "CLOUDFLARE_API_TOKEN": token.stdout.strip()}
+    for account, name in (("private-key", "GITHUB_APP_PRIVATE_KEY"), ("webhook-secret", "GITHUB_WEBHOOK_SECRET")):
+        v = subprocess.run(["security", "find-generic-password", "-s", SERVICE, "-a", account, "-w"],
+                           capture_output=True, text=True, check=False)
+        if v.returncode != 0 or not v.stdout.strip():
+            raise SystemExit(f"Keychain has no {SERVICE}/{account}; run create-app first")
+        r = subprocess.run([*WRANGLER, "secret", "put", name], input=v.stdout.strip(), text=True, env=env,
+                           cwd=os.path.join(HERE, "..", "gateway"), capture_output=True, check=False)
+        if r.returncode != 0:
+            raise SystemExit(f"wrangler secret put {name} failed (exit {r.returncode})")
+        print(f"Worker secret {name} set.")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("create-app")
+    c.add_argument("--name", default=os.environ.get("AUTOPILOT_GITHUB_APP_NAME") or "claude-autopilot",
+                   help="the app's name; GitHub app names are global, so pick your own (env AUTOPILOT_GITHUB_APP_NAME)")
+    c.add_argument("--org", default=os.environ.get("AUTOPILOT_GITHUB_ORG"),
+                   help="the org to create it on (env AUTOPILOT_GITHUB_ORG)")
+    c.add_argument("--gateway-url", help="the gateway's https URL (default: Keychain autopilot-gateway/url)")
+    sub.add_parser("worker-secrets")
+    a = p.parse_args()
+    if a.cmd == "create-app":
+        if not a.org:
+            raise SystemExit("--org (or AUTOPILOT_GITHUB_ORG) is required")
+        create_app(a.name, a.org, gateway_url(a.gateway_url))
+    else:
+        worker_secrets()
+
+
+if __name__ == "__main__":
+    main()
