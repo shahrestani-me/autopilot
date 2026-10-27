@@ -160,7 +160,7 @@ every 10-minute run would retry it.
    `select:mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__get_page_text,mcp__claude-in-chrome__javascript_tool,mcp__claude-in-chrome__tabs_close_mcp`).
    Not reachable: one line in the report, leave the stamp alone, carry on with section 2. With
    `preprod.sign_in`, add what signing in needs to the same ToolSearch:
-   `,mcp__claude-in-chrome__find,mcp__claude-in-chrome__computer,mcp__passhand__fill_login`.
+   `,mcp__claude-in-chrome__find,mcp__claude-in-chrome__computer,mcp__passhand__fill_login,mcp__passhand__list_saved_logins`.
 2. Open `keepalive.url` in a new tab and read the page text. Opening the app is what keeps the sign-in
    alive; a daily visit keeps the owner's single "Keep me logged in" session going.
 3. **Signed in as `keepalive.user`:** if `session_jwt_storage_key` is set, find how long the session has
@@ -182,7 +182,7 @@ every 10-minute run would retry it.
    - Less: send the **sign-in notice** below, "expires <local time>". With `preprod.sign_in`, don't:
      only a report line. The first visit after the session ends signs in again (step 4).
 4. **Login screen:** with `preprod.sign_in`, sign in (section 1c). Signed in now: a report line, done.
-   Otherwise never type anything: send the sign-in notice, "is signed out", with 1c's reason if it ran.
+   Otherwise never type anything: send the sign-in notice, "is signed out", with 1c's reason ("not tried" or failed).
    **The wrong user:** never sign out; send the sign-in notice, "is signed out".
    Tickets still get implemented and merged; only their preprod verification blocks.
 5. `touch "$STATE/<config name>.keepalive"` and close the tab. Add a report line only when a notice was
@@ -199,7 +199,7 @@ file another; when there is a 1c reason, add it to the open one instead (`"$AP" 
 The preprod session for <user> <expires <local time>|is signed out>. Autopilot can't verify merged work there without it.
 Fix: <the matching preprod.known_fixes entry, word for word>.
 Passhand: <1c's reason, quoted; leave this line out when 1c didn't run>
-Passhand fix: <when the reason says the login isn't saved, or Touch ID was asked for: "save it and mark it auto: docs/setup.md, Preprod sign-in with Passhand"; else leave this line out>
+Passhand fix: <when the reason says the login isn't saved or isn't auto, or Touch ID was asked for: "save it and mark it auto: docs/setup.md, Preprod sign-in with Passhand"; else leave this line out>
 Autopilot closes this issue by itself once it sees a fresh sign-in.
 EOF
 ```
@@ -226,8 +226,12 @@ One attempt, then stop. Repeated failed sign-ins can lock the test account.
    - there is no `USER`, or `sign_in.user` and `keepalive.user` are both set and differ (a config error:
      say so);
    - the tab's host isn't `web_url`'s host, or is on `forbidden.hosts`;
-   - `mcp__passhand__fill_login`, `mcp__claude-in-chrome__find` or `mcp__claude-in-chrome__computer`
-     isn't in this session (load them in one ToolSearch first).
+   - `mcp__passhand__fill_login`, `mcp__passhand__list_saved_logins`, `mcp__claude-in-chrome__find` or
+     `mcp__claude-in-chrome__computer` isn't in this session (load them in one ToolSearch first);
+   - `list_saved_logins` has no line for `web_url`'s origin and `NAME` (reason: "no saved login"), or
+     that line's fill mode isn't `auto` (reason: "the login isn't auto, so Passhand would wait for
+     Touch ID"). A line without a fill mode comes from an older Passhand: go on.
+   This writes no `signin-failed`: nothing was tried, so nothing can lock the account.
 1. Get the tab's id and its URL as it is open now, after any redirects (`tabs_context_mcp`).
 2. `fill_login` with `page_url` (that URL), `tab_id` (that id) and `username` (`NAME`). Never
    `submit: true`. "Filled …": go on. Anything else (no saved login, several accounts, Touch ID asked

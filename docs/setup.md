@@ -294,7 +294,8 @@ Set up once:
    passhand add <preprod host> <test user's username> --auto
    ```
 
-   `auto` fills without Touch ID, which a run needs because nobody is at the Mac
+   `auto` fills without Touch ID, which a run needs because nobody is at the Mac; runs check it with
+   `list_saved_logins` and don't fill a login that isn't `auto`
    ([Passhand on unattended logins](https://github.com/shahrestani-me/passhand#unattended-logins-test-and-qa-accounts)). Use it for **preprod
    test accounts only**: never a personal or production account, and never on a `forbidden.hosts` host.
    Accounts with 2FA or a passkey can't be signed in this way, nor a login form on another host than
