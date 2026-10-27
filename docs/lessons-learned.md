@@ -49,6 +49,10 @@ Each one is already built into the skills; this page says *why*, so nobody undoe
   UI, `read_network_requests`, or the app's own AI chat.
 - Never type passwords, not even test users'. The owner signs in once with "Keep me logged in"; a
   daily keep-alive visit refreshes the session. Signing out kills the only session.
+- A session that can't refresh still ends with its token, so a weekly sign-in by the owner blocked
+  verification every time. Since 0.17.0 a project can opt in to `preprod.sign_in`: Passhand fills the
+  test user's saved login in Chrome and Autopilot only clicks Sign in, never seeing the password. One
+  attempt per 20 hours, because repeated failed sign-ins can lock the account.
 - Chrome holds one session per site, so two-user flows are verified on one side, then handed to the
   owner as an exact incognito check.
 - The Chrome extension shows a 204 as 503 in `read_network_requests`; check the page's Resource

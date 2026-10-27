@@ -245,6 +245,7 @@ State, in `~/.local/state/autopilot/`:
 | `waiting/<ID>.json` | a recorded block and what unblocks it |
 | `runs/`, `streams/`, `current-jobs/`, `attempts/` | per-run hook state, claimed jobs, attempt counts |
 | `auth-broken`, `github-broken`, `<project>.preprod-broken`, `linear-automations` | problems runs found; `/autopilot:status` explains them |
+| `<project>.keepalive`, `<project>.signin-notice`, `<project>.signin-failed` | the last preprod keep-alive, the open sign-in notice, the last failed Passhand sign-in |
 | `reports/YYYY-MM-DD.md` | the daily report (or each config's `reports.dir`) |
 | `fallback.log`, `fallback-tick.log` | API mode: every run's output and cost; what the tick started |
 | `runstate.log`, `stream.log` | the hooks' own errors (they never fail a run) |
@@ -274,6 +275,7 @@ State, in `~/.local/state/autopilot/`:
 | An API-mode run is refused a command | Runs use `dontAsk`: only the allow list runs. Add what your repo's checks need with `$F config set allowed_tools '[...]'`; rules match exact words, no `*` inside a path, and a command with `if`/`for`, `$(…)` or a heredoc never matches |
 | A run used the wrong model | `$F config` shows the models in use. Known gap: in API mode a ticket's `Coder model:` line is not yet honoured, so the coder is always the `coder` setting |
 | Spend looks wrong | `~/.local/state/autopilot/openrouter-spend.json` is the record; with several runs at once a run can book the others' spend too (it overstates, never understates). A damaged ledger blocks all spend until you fix or remove it |
+| Preprod verification keeps asking you to sign in | Opt in to `preprod.sign_in` so runs sign the test user back in with Passhand ([docs/setup.md](docs/setup.md#5-preprod-sign-in-with-passhand-optional-since-0170)). Already on: the sign-in notice quotes Passhand's message; `/autopilot:status` shows `signin-failed` |
 | The Mac is off | Nothing runs; see [docs/backup-runner.md](docs/backup-runner.md) (proposal) |
 
 ## Tests

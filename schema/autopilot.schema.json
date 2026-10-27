@@ -159,7 +159,19 @@
               "type": "string",
               "description": "localStorage key of the session JWT. The keep-alive decodes only its exp claim, never prints or sends it."
             },
-            "warn_hours": { "type": "number", "default": 24, "description": "File a sign-in notice when the session has less than this left." }
+            "warn_hours": { "type": "number", "default": 24, "description": "File a sign-in notice when the session has less than this left. Not with sign_in: the first visit after the session ends signs in again." }
+          }
+        },
+        "sign_in": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["with", "user"],
+          "description": "Optional: sign a test user back in on the login screen with a local password filler, without Autopilot ever seeing the password (orchestrator section 1c). Without it Autopilot never signs in: it asks the owner.",
+          "properties": {
+            "with": { "enum": ["passhand"], "description": "passhand: the Passhand MCP server's fill_login fills the login saved for the tab's origin, in Chrome (preprod.browser: chrome)." },
+            "user": { "type": "string", "description": "The test user signed in this way (a test_users name); the one that must show as signed in afterwards." },
+            "username": { "type": "string", "description": "The username saved in Passhand, if it isn't the test user's name (e.g. an email address)." },
+            "keep_signed_in": { "type": "string", "description": "Label of a 'keep me signed in' checkbox to tick before signing in, e.g. 'Keep me logged in'." }
           }
         },
         "known_fixes": {
