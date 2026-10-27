@@ -75,8 +75,7 @@ preprod:
     warn_hours: 24
   # Optional: sign test-user back in with Passhand when the session ends (docs/setup.md, section 5).
   # sign_in:
-  #   with: passhand
-  #   user: test-user
+  #   with: passhand                       # signs in keepalive.user (test-user)
   #   keep_signed_in: Keep me logged in
   recipes:
     - Hard-reload after a deploy so the new bundle loads. Check Settings shows test-user before testing.

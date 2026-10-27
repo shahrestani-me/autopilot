@@ -159,7 +159,8 @@ every 10-minute run would retry it.
 1. Load the browser tools for `preprod.browser` in one ToolSearch (Chrome:
    `select:mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__get_page_text,mcp__claude-in-chrome__javascript_tool,mcp__claude-in-chrome__tabs_close_mcp`).
    Not reachable: one line in the report, leave the stamp alone, carry on with section 2. With
-   `preprod.sign_in`, add its tool to the same ToolSearch (`mcp__passhand__fill_login`).
+   `preprod.sign_in`, add what signing in needs to the same ToolSearch:
+   `,mcp__claude-in-chrome__find,mcp__claude-in-chrome__computer,mcp__passhand__fill_login`.
 2. Open `keepalive.url` in a new tab and read the page text. Opening the app is what keeps the sign-in
    alive; a daily visit keeps the owner's single "Keep me logged in" session going.
 3. **Signed in as `keepalive.user`:** if `session_jwt_storage_key` is set, find how long the session has
@@ -177,25 +178,28 @@ every 10-minute run would retry it.
    - Enough time left (at least `warn_hours`, default 24), or no key set: close the open notice if
      `$STATE/<config name>.signin-notice` exists (`"$AP" state <its ID> "<states.done>"`), then delete
      the file, even if `state` failed (the owner may have deleted the issue). Also
-     `rm -f "$STATE/<config name>.signin-failed"`.
+     `rm -f "$STATE/<config name>.signin-failed"`. (Section 1c's "Signed in" does the same.)
    - Less: send the **sign-in notice** below, "expires <local time>". With `preprod.sign_in`, don't:
      only a report line. The first visit after the session ends signs in again (step 4).
-4. **Login screen:** with `preprod.sign_in`, sign in (section 1c). Signed in as `keepalive.user` now:
-   handle it as step 3's "enough time left" and add a report line. Otherwise never type anything: send
-   the sign-in notice, "is signed out" (with Passhand's message or the page's error, if 1c ran).
+4. **Login screen:** with `preprod.sign_in`, sign in (section 1c). Signed in now: a report line, done.
+   Otherwise never type anything: send the sign-in notice, "is signed out", with 1c's reason if it ran.
    **The wrong user:** never sign out; send the sign-in notice, "is signed out".
    Tickets still get implemented and merged; only their preprod verification blocks.
 5. `touch "$STATE/<config name>.keepalive"` and close the tab. Add a report line only when a notice was
    filed or closed, or 1c ran.
 
-**Sign-in notice:** only if `$STATE/<config name>.signin-notice` doesn't exist (one open notice at a
-time). File it as Autopilot, assigned to `linear.owner`, so Linear notifies their phone:
+**Sign-in notice:** one open notice at a time. If `$STATE/<config name>.signin-notice` exists, don't
+file another; when there is a 1c reason, add it to the open one instead (`"$AP" comment <its ID>
+--body-file -`, the two "Passhand" lines below). Otherwise file it as Autopilot, assigned to
+`linear.owner`, so Linear notifies their phone:
 
 ```bash
 "$AP" create --team <linear.team> --project "<linear.projects[0]>" --state "<followup_state>" \
   --assignee "<linear.owner>" --title "Preprod sign-in <expires soon|is signed out>: <web_url> as <user>" --body-file - <<'EOF'
 The preprod session for <user> <expires <local time>|is signed out>. Autopilot can't verify merged work there without it.
 Fix: <the matching preprod.known_fixes entry, word for word>.
+Passhand: <1c's reason, quoted; leave this line out when 1c didn't run>
+Passhand fix: <when the reason says the login isn't saved, or Touch ID was asked for: "save it and mark it auto: docs/setup.md, Preprod sign-in with Passhand"; else leave this line out>
 Autopilot closes this issue by itself once it sees a fresh sign-in.
 EOF
 ```
@@ -211,28 +215,39 @@ fills a login saved on this Mac into the page, chosen by the tab's real origin; 
 reaches you. You still **never type a password**, never sign out, never open Passhand's settings page
 and never run the `passhand` CLI: managing logins is the owner's job.
 
+`USER` = `sign_in.user`, else `keepalive.user`: the test user signed in, and the one that must show
+afterwards. `NAME` = `sign_in.username`, else `USER`: the account saved in Passhand.
+
 One attempt, then stop. Repeated failed sign-ins can lock the test account.
 
-0. Don't try when `$STATE/<config name>.signin-failed` is less than 20 hours old (the owner hasn't
-   fixed it yet), when the tab's host isn't `web_url`'s host or is on `forbidden.hosts`, or when
-   `mcp__passhand__fill_login` isn't in this session (one ToolSearch, `select:mcp__passhand__fill_login`).
-   Return "not tried" and why.
+0. Don't try, and return "not tried" with the reason, when:
+   - `[ -n "$(find "$STATE/<config name>.signin-failed" -mmin -1200 2>/dev/null)" ]` (a sign-in failed
+     less than 20 hours ago and the owner hasn't fixed it yet);
+   - there is no `USER`, or `sign_in.user` and `keepalive.user` are both set and differ (a config error:
+     say so);
+   - the tab's host isn't `web_url`'s host, or is on `forbidden.hosts`;
+   - `mcp__passhand__fill_login`, `mcp__claude-in-chrome__find` or `mcp__claude-in-chrome__computer`
+     isn't in this session (load them in one ToolSearch first).
 1. Get the tab's id and its URL as it is open now, after any redirects (`tabs_context_mcp`).
-2. `fill_login` with `page_url` (that URL), `tab_id` (that id), and `username`
-   (`sign_in.username`, else `sign_in.user`). Never `submit: true`.
-   - "Filled …": go on. A two-step login (username page, then password page): call it once on each page.
-   - Anything else (no saved login, several accounts, Touch ID refused or timed out, several tabs):
-     failed. Keep its message; it never holds the password.
-3. `sign_in.keep_signed_in` set: tick that checkbox if it isn't ticked.
-4. Click the page's sign-in button.
-5. Reload `web_url` and check who is signed in. `sign_in.user`: done. Still a login screen, an error,
-   a 2FA code, a passkey or a CAPTCHA: failed (quote the page's message). Never answer those yourself.
-6. A permission check refuses `fill_login` or the click: failed, quoting the refusal. Don't retry
-   around it (section 7 of the worker says why).
+2. `fill_login` with `page_url` (that URL), `tab_id` (that id) and `username` (`NAME`). Never
+   `submit: true`. "Filled …": go on. Anything else (no saved login, several accounts, Touch ID asked
+   for and not given, several tabs): failed, with its message as the reason; it never holds the password.
+3. **Two-step login** (the page showed only a username field): find and click its Next or Continue
+   button, wait for the password page, then repeat steps 1–2 on it, once.
+4. `sign_in.keep_signed_in` set: find that checkbox and tick it if it isn't ticked.
+5. Find and click the page's sign-in button (`find`, then `computer` `left_click` on its ref). Never
+   click through `javascript_tool`.
+6. Reload `web_url` and check who is signed in. `USER`: **signed in**. Still a login screen, an error,
+   a 2FA code, a passkey or a CAPTCHA: failed, with the page's message as the reason. Never answer
+   those yourself.
+7. A permission check refuses `fill_login`, a click or a reload: failed, with the refusal as the reason.
+   Don't retry around it (worker section 7 says why).
 
-Failed: `date > "$STATE/<config name>.signin-failed"`, so the next runs ask the owner instead of trying
-again. The sign-in notice then carries the message and, when it says the login isn't saved or isn't
-`auto`, the fix from docs/setup.md ("Preprod sign-in with Passhand").
+**Signed in:** `rm -f "$STATE/<config name>.signin-failed"`, and close the open sign-in notice the way
+section 1b step 3 does ("enough time left"), from either caller.
+**Failed:** `date > "$STATE/<config name>.signin-failed"`, so the next runs ask the owner instead of
+trying again. The caller passes the reason on: the keep-alive in its sign-in notice, the worker in its
+block.
 
 ## 2. Pick the issue
 

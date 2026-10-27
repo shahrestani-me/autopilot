@@ -24,12 +24,6 @@ This repository is public. Anyone can read it, and every commit, PR, issue and c
 rest is up to whoever writes the change. Before a commit, read your diff for names that only make
 sense in one deployment.
 
-## Build and test
+## Layout, build and test
 
-```bash
-python3 -m unittest discover -s tests            # unit tests, stdlib only
-pip install pyyaml jsonschema graphql-core       # + config schema and Linear GraphQL contract tests
-(cd gateway && npm test)                         # gateway Worker, node --test, no dependencies
-```
-
-Layout: see [README.md, Repository](README.md#repository).
+See [README.md, Repository](README.md#repository) and [Tests](README.md#tests).

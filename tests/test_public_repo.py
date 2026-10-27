@@ -16,9 +16,16 @@ HOME = re.compile(r"/(?:Users|home)/([A-Za-z0-9._-]+)")
 HOME_NAMES = {"me", "you", "runner"}
 
 
-def _tracked_text_files():
-    out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
-    for name in out.splitlines():
+def _tracked_files():
+    try:
+        r = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return r.stdout.splitlines() if r.returncode == 0 else None
+
+
+def _tracked_text_files(names):
+    for name in names:
         path = ROOT / name
         try:
             yield name, path.read_text()
@@ -28,8 +35,11 @@ def _tracked_text_files():
 
 class PublicRepoTests(unittest.TestCase):
     def test_no_private_emails_or_home_paths(self):
+        names = _tracked_files()
+        if names is None:
+            self.skipTest("not a git checkout")
         found = []
-        for name, text in _tracked_text_files():
+        for name, text in _tracked_text_files(names):
             for lineno, line in enumerate(text.splitlines(), 1):
                 for m in EMAIL.finditer(line):
                     if m.group(1).lower() not in EMAIL_DOMAINS:

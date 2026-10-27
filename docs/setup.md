@@ -306,7 +306,7 @@ Set up once:
      browser: chrome
      sign_in:
        with: passhand
-       user: test-user                     # a test_users name
+       user: test-user                     # a test_users name; default: keepalive.user
        username: test-user@example.com     # the username saved in Passhand, if it isn't the name
        keep_signed_in: Keep me logged in   # a checkbox to tick, if the login form has one
    ```
