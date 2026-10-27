@@ -174,6 +174,20 @@
             "keep_signed_in": { "type": "string", "description": "Label of a 'keep me signed in' checkbox to tick before signing in, e.g. 'Keep me logged in'." }
           }
         },
+        "browser_host": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional: a long-lived Chromium of Autopilot's own on this Mac (bin/autopilot-browser), for browser drivers that connect over CDP, e.g. Playwright MCP with --cdp-endpoint. Only web_url's host, api_hosts and allow_hosts resolve there. The keep-alive (orchestrator section 1b) starts it and keeps its test user signed in, with Passhand when sign_in is set. Off unless set.",
+          "properties": {
+            "user": { "type": "string", "description": "The test user signed in there (a test_users name), and the name that must show on keepalive.url. Default: sign_in.user, else keepalive.user. Prefer a test user of its own: one user's sessions in two browsers can end each other (a sign-out in either ends them all)." },
+            "username": { "type": "string", "description": "The username saved in Passhand for that user, if it isn't the name. Default: sign_in.username when user is sign_in's user." },
+            "port": { "type": "integer", "minimum": 1024, "maximum": 65535, "default": 9333, "description": "CDP port, on 127.0.0.1 only." },
+            "allow_hosts": { "type": "array", "items": { "type": "string" }, "description": "Hosts the app needs besides web_url's and api_hosts (a font or asset CDN). Every other host fails to resolve. Never a forbidden.hosts host." },
+            "dismiss": { "type": "array", "items": { "type": "string" }, "description": "Button text of first-run prompts to click away, e.g. 'Maybe Later' on an install banner that blocks clicks in a fresh profile." },
+            "sign_in_button": { "type": "string", "default": "Sign in", "description": "Visible text of the login form's sign-in button (matched whole, in any case)." },
+            "next_button": { "type": "string", "default": "Next", "description": "A two-step login's Next button." }
+          }
+        },
         "known_fixes": {
           "type": "array",
           "description": "Mechanical owner steps the worker quotes exactly in an elicitation's 'What I need from you'.",

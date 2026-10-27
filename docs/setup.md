@@ -318,3 +318,76 @@ Day to day: a failed sign-in writes `~/.local/state/autopilot/<config name>.sign
 don't try again for 20 hours, so a wrong or missing login can't lock the account. The sign-in notice
 then quotes Passhand's message. Fix the login (`passhand list`, `passhand add …`, `passhand auto …`) or
 sign in by hand; the next keep-alive that finds the user signed in deletes the file and closes the notice.
+
+## 6. Browser host for CDP drivers (optional, since 0.18.0)
+
+Runs verify preprod in the owner's Chrome through the Claude in Chrome tools. A driver that connects
+over the Chrome DevTools Protocol (CDP), e.g. [Playwright MCP](https://github.com/microsoft/playwright-mcp)
+with `--cdp-endpoint`, can't use that Chrome: Chrome refuses remote debugging on its default profile.
+`bin/autopilot-browser` gives such drivers a browser of Autopilot's own, which stays signed in as a
+preprod test user between runs.
+
+- **One Chromium per Mac**, Playwright's build, with a fixed profile in
+  `~/.local/state/autopilot/browser-host/profile` and CDP on `127.0.0.1:<port>` (default 9333).
+  Chromium is started directly, not through a Node launcher, and `stop` ends the browser and everything
+  it started (renderers, Passhand's native host).
+- **Only preprod resolves there.** The browser's own resolver fails every host except `preprod.web_url`'s,
+  `preprod.api_hosts` and `browser_host.allow_hosts`, IP addresses included, and it uses no proxy, so a
+  `forbidden.hosts` host is unreachable whatever a page, driver or model asks for. A host that is both
+  allowed and forbidden is a config error and the browser doesn't start; so is a wildcard
+  (`*.cdn.example.net`) on one side that covers a host on the other. `status` also prints Playwright MCP's
+  `--allowed-origins` for the same hosts.
+- **Signing in.** With `preprod.sign_in`, Passhand's extension and native host are loaded into the
+  profile (its `NativeMessagingHosts/` folder: nothing global changes), and `sign-in` fills the test
+  user's saved `auto` login through Passhand's own MCP server, then clicks the sign-in button. Without
+  it, `sign-in` leaves the login page open in that window and you sign in there once. It clicks away
+  `browser_host.dismiss` prompts first: a fresh profile may show an app's install banner, which blocks
+  clicks until it's dismissed. The keep-alive (orchestrator section 1b) starts the browser and runs
+  `sign-in` every 20 hours.
+- **CDP is a local, unauthenticated full control of that browser.** Anything running as you on this Mac
+  can connect to `127.0.0.1:<port>` and drive it, signed in as the test user; a driver can also open
+  `file://` pages. So keep it to preprod test accounts, keep the Mac's user account to yourself, and
+  stop it when you don't need it. Loopback hosts are never allowed, so a page can't reach the port.
+  The state folder is private to you (0700): the profile holds the session.
+- **Use a test user of its own** (`browser_host.user`). One user's sessions in two browsers can end each
+  other: a sign-out in either can revoke them all, an app may keep only a few live sessions per user,
+  and a password reset ends them all. If it has to be the same user as the owner's Chrome, the browser
+  host keeps one persistent session (it never signs in while signed in) and never signs out.
+- Needs Playwright's Chromium (`npx playwright install chromium`, or `--chromium <path>` /
+  `AUTOPILOT_CHROMIUM`) and, for Passhand, a Passhand version that serves several browsers at once:
+  its helper in the owner's Chrome keeps working while the browser host runs and after it stops.
+
+```yaml
+preprod:
+  sign_in:
+    with: passhand
+  browser_host:
+    user: browser-test-user        # a test_users name of its own; default sign_in.user, then keepalive.user
+    dismiss: ["Maybe Later"]       # first-run prompts to click away
+    sign_in_button: Sign In        # default "Sign in"; matched whole, in any case
+```
+
+By hand:
+
+```bash
+B=bin/autopilot-browser
+$B start --project web-app --web-url https://staging.example.com --api-host api.staging.example.com \
+  --forbidden-host example.com --passhand
+$B sign-in --url https://staging.example.com/settings --user test-user --passhand --dismiss "Maybe Later"
+$B status        # running, cdp_endpoint, helpers, playwright_mcp_args
+$B stop          # nothing of it is left running
+```
+
+Then point the driver at it, e.g. `npx @playwright/mcp --cdp-endpoint http://127.0.0.1:9333 --allowed-origins
+"https://staging.example.com;https://api.staging.example.com"`.
+
+Notes for driver authors:
+
+- An app built with React Native for Web renders buttons as `div`s with no `button` role, so finding a
+  button by role fails; find it by its visible text. `sign-in` clicks by visible text for this reason.
+- Clicks over CDP are real mouse events (`Input.dispatchMouseEvent`); a JavaScript `el.click()` may not
+  reach a touch-style pressable.
+- A Passhand `fill_login` from the driver's side needs no `tab_id` there (CDP has no Chrome tab ids);
+  Passhand finds the browser by the page's URL and refuses when two tabs or browsers show the same one.
+- If Passhand's extension folder changes while the browser host runs, `status` says
+  `"extension_changed": true`: stop and start it, since a running profile keeps the old extension code.

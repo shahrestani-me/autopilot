@@ -53,6 +53,14 @@ Each one is already built into the skills; this page says *why*, so nobody undoe
   verification every time. Since 0.17.0 a project can opt in to `preprod.sign_in`: Passhand fills the
   test user's saved login in Chrome and Autopilot only clicks Sign in, never seeing the password. One
   attempt per 20 hours, because repeated failed sign-ins can lock the account.
+- A CDP driver can't attach to the owner's Chrome: Chrome refuses remote debugging on its default
+  profile. A separate Chromium with its own profile works, with Passhand loaded through the profile's
+  `NativeMessagingHosts/` folder. Killing a Node launcher left that Chromium running, so the browser
+  host (0.18.0) starts Chromium itself and `stop` ends its whole process tree. Limiting hosts in the
+  browser's resolver blocks every other host, IP addresses included, whatever the driver asks for.
+- One test user's sessions in two browsers can end each other (a sign-out may revoke them all, an app
+  may cap live sessions per user), so a second browser gets a test user of its own, or one persistent
+  session that never signs out.
 - Chrome holds one session per site, so two-user flows are verified on one side, then handed to the
   owner as an exact incognito check.
 - The Chrome extension shows a 204 as 503 in `read_network_requests`; check the page's Resource
