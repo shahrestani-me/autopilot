@@ -96,7 +96,7 @@ def allowed_hosts(web_url, api_hosts=(), extra=(), forbidden=()):
     banned = {host_of(f) for f in forbidden}
     covers = lambda a, b: a == b or (a.startswith("*.") and b.endswith(a[1:]))  # noqa: E731
     clash = [h for h in hosts if any(covers(h, f) or covers(f, h) for f in banned)]
-    local = [h for h in hosts if h in ("localhost", "*.localhost") or h.endswith(".localhost")
+    local = [h for h in hosts if h in ("localhost", "*.localhost", "0.0.0.0") or h.endswith(".localhost")
              or re.match(r"^127\.\d+\.\d+\.\d+$", h)]
     if local:  # a page there could reach the browser's own CDP port
         raise Fail(f"the browser host never allows loopback hosts: {', '.join(local)}", 2)
@@ -388,7 +388,8 @@ class Page:
     def navigate(self, url):
         # Marks the old document, so probe() can tell it from the new one until the navigation commits.
         self.evaluate("window.__autopilotOld = true")
-        self.cdp.send("Page.navigate", {"url": url})
+        if not self.cdp.send("Page.navigate", {"url": url}).get("loaderId"):  # same document (a #hash)
+            self.evaluate("delete window.__autopilotOld")
 
     def href(self):
         return self.evaluate("location.href")

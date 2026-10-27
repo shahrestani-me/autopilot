@@ -102,7 +102,7 @@ class HostTests(Base):
             self.ab.allowed_hosts("https://staging.example.com", ["api.example.com"], [], ["*.example.com"])
 
     def test_loopback_is_never_allowed(self):
-        for h in ("localhost", "app.localhost", "127.0.0.1"):
+        for h in ("localhost", "app.localhost", "127.0.0.1", "0.0.0.0"):
             with self.subTest(host=h), self.assertRaises(self.ab.Fail) as e:
                 self.ab.allowed_hosts("https://staging.example.com", [], [h])
             self.assertEqual(e.exception.code, 2)
