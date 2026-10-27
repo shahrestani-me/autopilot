@@ -77,6 +77,10 @@ preprod:
   # sign_in:
   #   with: passhand                       # signs in keepalive.user (test-user)
   #   keep_signed_in: Keep me logged in
+  # Optional: a Chromium of Autopilot's own for CDP drivers such as Playwright MCP (docs/setup.md, section 6).
+  # browser_host:
+  #   user: browser-test-user            # a test user of its own
+  #   dismiss: ["Maybe Later"]           # first-run prompts to click away
   recipes:
     - Hard-reload after a deploy so the new bundle loads. Check Settings shows test-user before testing.
     - Drive the UI; read network responses with read_network_requests. Never read tokens or cookies to call the API yourself.

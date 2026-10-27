@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""autopilot-browser: the browser host, a long-lived Chromium of Autopilot's own on this Mac.
+
+Browser drivers that connect over the Chrome DevTools Protocol (CDP), e.g. Playwright MCP with
+`--cdp-endpoint`, can't use the owner's Chrome: Chrome refuses remote debugging on its default
+profile. So this command owns one Chromium with a fixed profile folder, which stays signed in as a
+preprod test user between runs:
+
+  start     launch it (Playwright's Chromium, or --chromium), CDP on 127.0.0.1:<port>, Passhand loaded
+  status    is it running, its CDP endpoint, and the Playwright MCP arguments for it
+  stop      close it and every process it started (renderers, Passhand's native host); nothing is left
+  sign-in   open a page in it, click away first-run prompts, and if the login screen shows, sign the
+            test user in with Passhand (or, without --passhand, leave the page for the owner)
+
+Only the hosts given at start resolve: preprod's web host, its API hosts and --allow-host. Every
+other host, so every `forbidden.hosts` host, fails in the browser's own resolver, whatever a page,
+a driver or a model asks for. An allowed host that is also forbidden is a config error.
+
+Chromium is started directly, not through a Node launcher, so there is no launcher to die and leave
+the browser running. One browser host per Mac: start refuses while one runs for another project.
+
+Signing in never sees a password: Passhand's own MCP server (`passhand mcp`, from its native-host
+manifest) fills the login saved for the page's real origin, then this clicks the sign-in button.
+One attempt; a failure writes $STATE/<project>.signin-failed and no attempt follows for 20 hours,
+the same gate as orchestrator section 1c. It never signs anyone out.
+
+Output is JSON. Exit codes: 0 ok, 1 error, 2 bad arguments or setup, 3 needs the owner (not running,
+signed out, sign-in failed or not tried).
+
+State: $AUTOPILOT_STATE_DIR (default ~/.local/state/autopilot)/browser-host/
+       profile/      the Chromium profile (its NativeMessagingHosts/ holds Passhand's manifest)
+       host.json     what start launched: pid, port, project, hosts, Passhand
+       chromium.log  the browser's own output
+"""
+
+import argparse
+import base64
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+STATE_DIR = os.path.expanduser(os.environ.get("AUTOPILOT_STATE_DIR", "~/.local/state/autopilot"))
+HOST_DIR = os.path.join(STATE_DIR, "browser-host")
+PROFILE = os.path.join(HOST_DIR, "profile")
+HOST_FILE = os.path.join(HOST_DIR, "host.json")
+DEFAULT_PORT = 9333
+PLAYWRIGHT_CACHE = os.path.expanduser("~/Library/Caches/ms-playwright")
+PASSHAND_EXTENSION = os.path.expanduser(
+    os.environ.get("AUTOPILOT_PASSHAND_EXTENSION", "~/Library/Application Support/passhand/extension"))
+PASSHAND_HOST = os.path.expanduser(os.environ.get(
+    "AUTOPILOT_PASSHAND_HOST",
+    "~/Library/Application Support/Google/Chrome/NativeMessagingHosts/me.shahrestani.passhand.json"))
+SIGNIN_RETRY_S = 20 * 3600  # orchestrator 1c: one failed sign-in, then none for 20 hours
+HOST_NAME = re.compile(r"^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+
+
+class Fail(Exception):
+    """A user-facing error: printed as {"error": ...}, exit `code`."""
+
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+# ---------------------------------------------------------------- hosts
+
+
+def host_of(value):
+    """'https://Staging.example.com:8443/x' or 'staging.example.com' → 'staging.example.com'."""
+    value = value.strip().lower()
+    host = urllib.parse.urlsplit(value if "://" in value else "//" + value).hostname or ""
+    if not HOST_NAME.match(host):
+        raise Fail(f"not a host name: {value!r}", 2)
+    return host
+
+
+def allowed_hosts(web_url, api_hosts=(), extra=(), forbidden=()):
+    """The hosts the browser may resolve, in order, without duplicates. Refuses a forbidden one."""
+    hosts = []
+    for h in [host_of(web_url), *map(host_of, api_hosts), *map(host_of, extra)]:
+        if h not in hosts:
+            hosts.append(h)
+    banned = {host_of(f) for f in forbidden}
+    clash = [h for h in hosts if h in banned]
+    if clash:
+        raise Fail(f"allowed and forbidden at once: {', '.join(clash)}. Fix the project config.", 2)
+    return hosts
+
+
+def resolver_rules(hosts):
+    """Chromium's --host-resolver-rules: every host fails to resolve except these."""
+    return ", ".join(["MAP * ~NOTFOUND", *(f"EXCLUDE {h}" for h in hosts)])
+
+
+def chromium_args(profile, port, hosts, extensions=()):
+    args = [
+        f"--user-data-dir={profile}",
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--host-resolver-rules={resolver_rules(hosts)}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-component-update",
+        "--use-mock-keychain",  # no macOS Keychain prompt for the profile's storage key
+        "--password-store=basic",
+    ]
+    if extensions:
+        joined = ",".join(extensions)
+        args += [
+            f"--disable-extensions-except={joined}",
+            f"--load-extension={joined}",
+            "--disable-features=DisableLoadExtensionCommandLineSwitch",
+        ]
+    return args
+
+
+def playwright_mcp_args(port, hosts):
+    """What a Playwright MCP server needs to use this browser, limited to the same hosts."""
+    return ["--cdp-endpoint", f"http://127.0.0.1:{port}",
+            "--allowed-origins", ";".join(f"https://{h}" for h in hosts)]
+
+
+# ---------------------------------------------------------------- processes
+
+
+def ps():
+    """{pid: (ppid, command)} for every process."""
+    out = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    return procs
+
+
+def find_main(procs, profile=PROFILE):
+    """The browser's main process: uses this profile, and its parent doesn't (helpers' parents do)."""
+    flag = f"--user-data-dir={profile}"
+    users = {pid for pid, (_, cmd) in procs.items() if flag in cmd and " --type=" not in cmd}
+    roots = [pid for pid in users if procs[pid][0] not in users]
+    return min(roots) if roots else None
+
+
+def descendants(procs, root):
+    """Every process started by `root`, at any depth (renderers, GPU, crashpad, native hosts)."""
+    children = {}
+    for pid, (ppid, _) in procs.items():
+        children.setdefault(ppid, []).append(pid)
+    found, todo = [], list(children.get(root, []))
+    while todo:
+        pid = todo.pop()
+        found.append(pid)
+        todo.extend(children.get(pid, []))
+    return sorted(found)
+
+
+def native_hosts(procs, pids):
+    """Of `pids`, the native-messaging hosts: started with an extension origin as first argument."""
+    return [p for p in pids if p in procs and " chrome-extension://" in procs[p][1]]
+
+
+def alive(pid):
+    try:  # a child of ours that ended is a zombie until reaped, and kill(0) would still find it
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except ChildProcessError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_gone(pids, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not any(alive(p) for p in pids):
+            return True
+        time.sleep(0.2)
+    return not any(alive(p) for p in pids)
+
+
+def signal_all(pids, sig):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+# ---------------------------------------------------------------- CDP
+
+
+def http_json(port, path, method="GET", timeout=3):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "null")
+
+
+def cdp_version(port):
+    try:
+        return http_json(port, "/json/version")
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def ws_frame(payload, opcode=1, mask=None):
+    """One client→server WebSocket frame (RFC 6455): final, masked."""
+    mask = mask if mask is not None else os.urandom(4)
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 1 << 16:
+        head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def ws_parse(buf):
+    """(fin, opcode, payload, rest) for the first whole frame in `buf`, or None for more bytes."""
+    if len(buf) < 2:
+        return None
+    fin, opcode = bool(buf[0] & 0x80), buf[0] & 0x0F
+    masked, n, i = bool(buf[1] & 0x80), buf[1] & 0x7F, 2
+    if n == 126:
+        if len(buf) < 4:
+            return None
+        n, i = int.from_bytes(buf[2:4], "big"), 4
+    elif n == 127:
+        if len(buf) < 10:
+            return None
+        n, i = int.from_bytes(buf[2:10], "big"), 10
+    mask = b""
+    if masked:
+        if len(buf) < i + 4:
+            return None
+        mask, i = buf[i:i + 4], i + 4
+    if len(buf) < i + n:
+        return None
+    payload = buf[i:i + n]
+    if masked:
+        payload = bytes(b ^ mask[j % 4] for j, b in enumerate(payload))
+    return fin, opcode, payload, buf[i + n:]
+
+
+class Cdp:
+    """A minimal CDP client over a WebSocket to one target. Ignores events."""
+
+    def __init__(self, ws_url, timeout=30):
+        u = urllib.parse.urlsplit(ws_url)
+        if u.hostname not in ("127.0.0.1", "localhost"):
+            raise Fail(f"refusing a non-local CDP endpoint: {u.hostname}")
+        self.timeout = timeout
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                          .encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise Fail("CDP closed the connection during the handshake")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0] + b" ":
+            raise Fail(f"CDP refused the WebSocket: {head.splitlines()[0].decode(errors='replace')}")
+        self.next_id = 0
+
+    def _frame(self):
+        while True:
+            parsed = ws_parse(self.buf)
+            if parsed:
+                fin, opcode, payload, self.buf = parsed
+                return fin, opcode, payload
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise Fail("CDP closed the connection")
+            self.buf += chunk
+
+    def _message(self):
+        data = b""
+        while True:
+            fin, opcode, payload = self._frame()
+            if opcode == 0x8:
+                raise Fail("CDP closed the connection")
+            if opcode == 0x9:
+                self.sock.sendall(ws_frame(payload, opcode=0xA))
+                continue
+            if opcode in (0x1, 0x2, 0x0):
+                data += payload
+                if fin:
+                    return json.loads(data.decode())
+
+    def send(self, method, params=None):
+        self.next_id += 1
+        msg_id = self.next_id
+        self.sock.sendall(ws_frame(json.dumps({"id": msg_id, "method": method, "params": params or {}}).encode()))
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            msg = self._message()
+            if msg.get("id") == msg_id:
+                if "error" in msg:
+                    raise Fail(f"CDP {method}: {msg['error'].get('message')}")
+                return msg.get("result", {})
+        raise Fail(f"CDP {method}: no answer in {self.timeout} s")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# Page-side helpers, defined fresh in every evaluate: nothing is left in the page between calls.
+JS_HELPERS = r"""
+const vis = e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+const findText = text => {
+  const want = text.trim().toLowerCase();
+  const all = [...document.querySelectorAll('body *')].filter(e =>
+    (e.tagName === 'INPUT' ? (e.value || '') : (e.innerText || '')).trim().toLowerCase() === want && vis(e));
+  const inner = all.filter(e => !all.some(o => o !== e && e.contains(o)));
+  const clickable = e => { for (let n = e, i = 0; n && i < 4; n = n.parentElement, i++) {
+    if (n.matches('button,a,input,[role=button],[role=link],[role=checkbox],[tabindex]') ||
+        getComputedStyle(n).cursor === 'pointer') return true; } return false; };
+  return inner.find(clickable) || inner[inner.length - 1] || null;
+};
+const centre = e => { e.scrollIntoView({block: 'center', inline: 'center'});
+  const r = e.getBoundingClientRect(); return {x: r.left + r.width / 2, y: r.top + r.height / 2}; };
+"""
+
+
+def _js(body, *args):
+    """An expression running `body` (a function body using JS_HELPERS) with JSON arguments."""
+    return f"(({', '.join(f'a{i}' for i in range(len(args)))}) => {{{JS_HELPERS}\n{body}\n}})" \
+           f"({', '.join(json.dumps(a) for a in args)})"
+
+
+class Page:
+    """One tab of the browser host, driven over CDP: real (trusted) mouse clicks, no typing."""
+
+    def __init__(self, port, url="about:blank"):
+        self.port = port
+        target = http_json(port, "/json/new?" + urllib.parse.quote(url, safe=""), method="PUT")
+        self.target_id = target["id"]
+        self.cdp = Cdp(target["webSocketDebuggerUrl"])
+
+    def evaluate(self, expression):
+        r = self.cdp.send("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
+        if "exceptionDetails" in r:
+            raise Fail(f"page script failed: {r['exceptionDetails'].get('text')}")
+        return r.get("result", {}).get("value")
+
+    def navigate(self, url):
+        self.cdp.send("Page.navigate", {"url": url})
+
+    def href(self):
+        return self.evaluate("location.href")
+
+    def probe(self, user):
+        """What the page shows now: still loading, a login form, the user's name."""
+        return self.evaluate(_js(r"""
+const text = document.body ? document.body.innerText : '';
+const esc = a0.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const fields = sel => [...document.querySelectorAll(sel)].some(vis);
+return {
+  ready: document.readyState === 'complete',
+  password: fields('input[type=password]'),
+  username_field: fields('input[type=email],input[autocomplete~=username],input[name*=user i],input[name*=email i]'),
+  user: a0 !== '' && new RegExp('(^|[^\\w@.-])' + esc + '($|[^\\w@.-])', 'i').test(text),
+};""", user))
+
+    def has_text(self, text):
+        return bool(self.evaluate(_js("return !!findText(a0);", text)))
+
+    def _click_at(self, point):
+        for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
+            self.cdp.send("Input.dispatchMouseEvent", {"type": kind, "x": point["x"], "y": point["y"],
+                                                       "button": "left", "clickCount": 1})
+
+    def click_text(self, text):
+        """Click the element showing exactly `text` (the clickable one, if several do). False: none."""
+        point = self.evaluate(_js("const e = findText(a0); return e ? centre(e) : null;", text))
+        if not point:
+            return False
+        self._click_at(point)
+        return True
+
+    def tick(self, label):
+        """Tick the checkbox labelled `label`. 'ticked', 'already' or 'missing'."""
+        found = self.evaluate(_js(r"""
+const l = findText(a0); if (!l) return null;
+for (let n = l, i = 0; n && i < 4; n = n.parentElement, i++) {
+  const box = n.querySelector('input[type=checkbox],[role=checkbox]');
+  if (box) { const on = box.checked === true || box.getAttribute('aria-checked') === 'true';
+    return on ? 'already' : (vis(box) ? centre(box) : centre(l)); } }
+return centre(l);""", label))
+        if found is None:
+            return "missing"
+        if found == "already":
+            return "already"
+        self._click_at(found)
+        return "ticked"
+
+    def message(self, limit=200):
+        """The page's own error or alert text, for a failed sign-in's reason."""
+        text = self.evaluate(_js(r"""
+const a = [...document.querySelectorAll('[role=alert],[aria-live]')].filter(vis).map(e => e.innerText.trim());
+return a.filter(Boolean).join(' / ');"""))
+        return (text or "")[:limit]
+
+    def close(self):
+        self.cdp.close()
+        try:
+            http_json(self.port, f"/json/close/{self.target_id}")
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+
+
+# ---------------------------------------------------------------- Passhand
+
+
+class Passhand:
+    """Passhand's own MCP server over stdio (`passhand mcp`): fills logins, never returns a password."""
+
+    def __init__(self, binary, timeout=150):
+        self.timeout = timeout
+        self.proc = subprocess.Popen([binary, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
+        self.buf, self.next_id = b"", 0
+        self._call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "autopilot-browser", "version": "1"}})
+        self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _write(self, msg):
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def _call(self, method, params):
+        self.next_id += 1
+        self._write({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params})
+        deadline = time.time() + self.timeout
+        while True:
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == self.next_id:
+                    if "error" in msg:
+                        raise Fail(f"Passhand {method}: {msg['error'].get('message')}")
+                    return msg.get("result", {})
+            left = deadline - time.time()
+            if left <= 0 or not select.select([self.proc.stdout], [], [], left)[0]:
+                raise Fail(f"Passhand {method}: no answer in {self.timeout} s")
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            if not chunk:
+                raise Fail("Passhand's MCP server exited")
+            self.buf += chunk
+
+    def tool(self, name, arguments):
+        """(text, is_error)."""
+        r = self._call("tools/call", {"name": name, "arguments": arguments})
+        text = " ".join(c.get("text", "") for c in r.get("content", []) if c.get("type") == "text")
+        return text, bool(r.get("isError"))
+
+    def saved_logins(self):
+        """[(origin, username, mode or None)] from list_saved_logins."""
+        text, _ = self.tool("list_saved_logins", {})
+        rows = []
+        for line in text.splitlines():
+            parts = [p.strip() for p in line.split("—")]
+            if len(parts) >= 2 and "://" in parts[0]:
+                rows.append((parts[0], parts[1], parts[2] if len(parts) > 2 else None))
+        return rows
+
+    def fill(self, page_url, username):
+        return self.tool("fill_login", {"page_url": page_url, "username": username})
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+            self.proc.stdout.close()
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+
+
+def passhand_binary(manifest):
+    try:
+        with open(manifest) as f:
+            path = json.load(f).get("path")
+    except (OSError, ValueError):
+        path = None
+    return os.environ.get("AUTOPILOT_PASSHAND_BIN") or path
+
+
+# ---------------------------------------------------------------- state
+
+
+def read_host():
+    try:
+        with open(HOST_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_host(data):
+    tmp = HOST_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, HOST_FILE)
+
+
+class host_lock:
+    """One start or stop at a time on this Mac."""
+
+    def __enter__(self):
+        os.makedirs(HOST_DIR, exist_ok=True)
+        self.f = open(os.path.join(HOST_DIR, "lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def fingerprint(folder):
+    """Changes when any file in the folder does: the extension loaded at start may be stale."""
+    h = hashlib.sha256()
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for name in sorted(files):
+            p = os.path.join(root, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            h.update(f"{os.path.relpath(p, folder)}:{st.st_size}:{int(st.st_mtime)}\n".encode())
+    return h.hexdigest()[:16]
+
+
+def find_chromium():
+    """Playwright's newest Chromium build, or $AUTOPILOT_CHROMIUM."""
+    if os.environ.get("AUTOPILOT_CHROMIUM"):
+        return os.environ["AUTOPILOT_CHROMIUM"]
+    found = glob.glob(os.path.join(PLAYWRIGHT_CACHE, "chromium-*", "chrome-mac*", "Chromium.app",
+                                   "Contents", "MacOS", "Chromium"))
+    build = lambda p: int(re.search(r"chromium-(\d+)", p).group(1))  # noqa: E731
+    return max(found, key=build) if found else None
+
+
+def signin_failed_file(project):
+    return os.path.join(STATE_DIR, f"{project}.signin-failed")
+
+
+# ---------------------------------------------------------------- commands
+
+
+def status(procs=None):
+    host = read_host()
+    procs = procs if procs is not None else ps()
+    main = find_main(procs)
+    port = host.get("port", DEFAULT_PORT)
+    out = {"running": main is not None, "pid": main, "port": port, "profile": PROFILE,
+           "project": host.get("project"), "allow_hosts": host.get("allow_hosts", [])}
+    if main is None:
+        return out
+    version = cdp_version(port)
+    out["cdp_endpoint"] = f"http://127.0.0.1:{port}"
+    out["cdp"] = bool(version)
+    out["browser"] = (version or {}).get("Browser")
+    out["passhand"] = bool(host.get("passhand"))
+    out["helpers"] = native_hosts(procs, descendants(procs, main))
+    if host.get("extension_fingerprint"):
+        out["extension_changed"] = fingerprint(PASSHAND_EXTENSION) != host["extension_fingerprint"]
+    out["playwright_mcp_args"] = playwright_mcp_args(port, out["allow_hosts"])
+    return out
+
+
+def start(args):
+    hosts = allowed_hosts(args.web_url, args.api_host, args.allow_host, args.forbidden_host)
+    chromium = args.chromium or find_chromium()
+    if not chromium or not os.path.exists(chromium):
+        raise Fail("no Chromium: install Playwright's (`npx playwright install chromium`) or pass --chromium", 2)
+    extensions = []
+    if args.passhand:
+        if not os.path.isfile(os.path.join(PASSHAND_EXTENSION, "manifest.json")):
+            raise Fail(f"Passhand's extension isn't installed at {PASSHAND_EXTENSION}", 2)
+        if not passhand_binary(PASSHAND_HOST):
+            raise Fail(f"Passhand's native-host manifest isn't at {PASSHAND_HOST}: run Passhand's install.sh", 2)
+        extensions.append(PASSHAND_EXTENSION)
+    with host_lock():
+        procs = ps()
+        main = find_main(procs)
+        if main is not None:
+            host = read_host()
+            if host.get("project") == args.project and host.get("allow_hosts") == hosts \
+                    and host.get("port") == args.port and bool(host.get("passhand")) == args.passhand:
+                return {"started": False, "already_running": True, **status(procs)}
+            raise Fail(f"the browser host already runs for {host.get('project') or 'another project'} with other "
+                       "settings: stop it first", 1)
+        if cdp_version(args.port) is not None:
+            raise Fail(f"port {args.port} already serves another browser's CDP; pass --port", 1)
+        os.makedirs(PROFILE, exist_ok=True)
+        if args.passhand:
+            hosts_dir = os.path.join(PROFILE, "NativeMessagingHosts")
+            os.makedirs(hosts_dir, exist_ok=True)
+            shutil.copyfile(PASSHAND_HOST, os.path.join(hosts_dir, os.path.basename(PASSHAND_HOST)))
+        with open(os.path.join(HOST_DIR, "chromium.log"), "ab") as log:
+            proc = subprocess.Popen([chromium, *chromium_args(PROFILE, args.port, hosts, extensions), "about:blank"],
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        write_host({"pid": proc.pid, "port": args.port, "project": args.project, "allow_hosts": hosts,
+                    "forbidden_hosts": sorted({host_of(f) for f in args.forbidden_host}),
+                    "passhand": args.passhand, "chromium": chromium,
+                    "extension_fingerprint": fingerprint(PASSHAND_EXTENSION) if args.passhand else None,
+                    "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        deadline = time.time() + 30
+        while time.time() < deadline and cdp_version(args.port) is None:
+            if proc.poll() is not None:
+                raise Fail(f"Chromium exited at once ({proc.returncode}); see {HOST_DIR}/chromium.log")
+            time.sleep(0.3)
+        if cdp_version(args.port) is None:
+            stop_browser()
+            raise Fail("Chromium started but its CDP endpoint never answered; stopped it again")
+        return {"started": True, **status()}
+
+
+def stop_browser():
+    procs = ps()
+    main = find_main(procs)
+    if main is None:
+        return {"stopped": False, "running": False}
+    family = descendants(procs, main)
+    port = read_host().get("port", DEFAULT_PORT)
+    version, closing = cdp_version(port), False
+    if version and version.get("webSocketDebuggerUrl"):  # a clean close saves the profile
+        try:
+            cdp = Cdp(version["webSocketDebuggerUrl"], timeout=5)
+            cdp.send("Browser.close")
+            cdp.close()
+            closing = True
+        except (Fail, OSError):
+            pass
+    if not wait_gone([main], 10 if closing else 0):
+        signal_all([main], signal.SIGTERM)
+        if not wait_gone([main], 5):
+            signal_all([main], signal.SIGKILL)
+            wait_gone([main], 5)
+    # Whatever the browser started and outlived it, e.g. a native host that didn't see stdin close.
+    left = [p for p in family if alive(p) and procs.get(p) and ps().get(p, (None, None))[1] == procs[p][1]]
+    signal_all(left, signal.SIGTERM)
+    if not wait_gone(left, 3):
+        signal_all(left, signal.SIGKILL)
+        wait_gone(left, 3)
+    remaining = [p for p in [main, *family] if alive(p) and ps().get(p, (None, None))[1] == procs[p][1]]
+    return {"stopped": not remaining, "pid": main, "ended": len(family) + 1,
+            "native_hosts": native_hosts(procs, family), "left": remaining}
+
+
+def stop(args):
+    with host_lock():
+        out = stop_browser()
+    if out.get("left"):
+        raise Fail(f"could not end {out['left']}")
+    return out
+
+
+def wait_for(page, user, dismiss, seconds):
+    """Poll until the page shows the user or a login form, clicking away `dismiss` prompts meanwhile."""
+    deadline, last = time.time() + seconds, {}
+    while time.time() < deadline:
+        for text in dismiss:
+            if page.has_text(text):
+                page.click_text(text)
+                time.sleep(0.5)
+        last = page.probe(user) or {}
+        if last.get("user") and not last.get("password"):
+            return "signed-in", last
+        if last.get("ready") and (last.get("password") or last.get("username_field")):
+            time.sleep(1)  # a login form can flash while the app restores its session
+            again = page.probe(user) or {}
+            if again.get("user") and not again.get("password"):
+                return "signed-in", again
+            if again.get("password") or again.get("username_field"):
+                return "login", again
+        time.sleep(0.5)
+    return "unknown", last
+
+
+def sign_in(args, page=None, passhand=None, now=None):
+    """Make sure `args.user` is signed in on `args.url` in the browser host. Returns (result, exit code)."""
+    host = read_host()
+    project = args.project or host.get("project")
+    url_host = host_of(args.url)
+    if url_host not in host.get("allow_hosts", []) or url_host in host.get("forbidden_hosts", []):
+        raise Fail(f"{url_host} isn't one of the browser host's allowed hosts", 2)
+    if page is None:
+        if find_main(ps()) is None:
+            return {"state": "not-running", "reason": "the browser host isn't running: start it first"}, 3
+        page = Page(host.get("port", DEFAULT_PORT))
+    keep_tab = False
+    try:
+        page.navigate(args.url)
+        state, seen = wait_for(page, args.user, args.dismiss, args.timeout)
+        if state == "signed-in":
+            if project:
+                _remove(signin_failed_file(project))
+            return {"state": "signed-in", "user": args.user}, 0
+        if state == "unknown":
+            return {"state": "unknown", "reason": f"neither a login form nor {args.user} showed within "
+                                                   f"{args.timeout} s (another user, or the page didn't load)"}, 3
+        if not args.passhand:
+            keep_tab = True
+            return {"state": "signed-out", "reason": f"not tried: sign in as {args.user} in the browser host's "
+                                                     "window (left open on the login page)"}, 3
+        result = _passhand_sign_in(args, page, project, passhand, seen, now or time.time())
+        return result, 0 if result["state"] == "signed-in" else 3
+    finally:
+        if not keep_tab:
+            page.close()
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _passhand_sign_in(args, page, project, passhand, seen, now):
+    failed = signin_failed_file(project) if project else None
+    if failed and os.path.exists(failed) and now - os.path.getmtime(failed) < SIGNIN_RETRY_S:
+        return {"state": "not-tried", "reason": "a sign-in failed less than 20 hours ago"}
+    name = args.username or args.user
+    own = passhand is None
+    if own:
+        binary = passhand_binary(os.path.join(PROFILE, "NativeMessagingHosts", os.path.basename(PASSHAND_HOST))) \
+            or passhand_binary(PASSHAND_HOST)
+        if not binary:
+            return {"state": "not-tried", "reason": "Passhand isn't installed"}
+        passhand = Passhand(binary)
+    try:
+        href = page.href()
+        origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(href))
+        if host_of(href) != host_of(args.url):
+            return {"state": "not-tried", "reason": f"the login form is on {host_of(href)}, not {host_of(args.url)}"}
+        rows = [r for r in passhand.saved_logins() if r[0] == origin and r[1] == name]
+        if not rows:
+            return {"state": "not-tried", "reason": f"no saved login for {name} on {origin}"}
+        if rows[0][2] not in (None, "auto"):
+            return {"state": "not-tried", "reason": "the login isn't auto, so Passhand would wait for Touch ID"}
+
+        def fail(reason):
+            if failed:
+                with open(failed, "w") as f:
+                    f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+            return {"state": "failed", "reason": reason}
+
+        text, is_error = passhand.fill(href, name)
+        if is_error or not text.startswith("Filled"):
+            return fail(text or "Passhand filled nothing")
+        if text.startswith("Filled only the username"):  # two-step login: Next, then the password page
+            if not page.click_text(args.next_button):
+                return fail(f"a username-only form without a '{args.next_button}' button")
+            deadline = time.time() + args.timeout
+            while time.time() < deadline and not (page.probe(args.user) or {}).get("password"):
+                time.sleep(0.5)
+            text, is_error = passhand.fill(page.href(), name)
+            if is_error or not text.startswith("Filled the"):
+                return fail(text or "Passhand filled no password")
+        if args.keep_signed_in and page.tick(args.keep_signed_in) == "missing":
+            return fail(f"no '{args.keep_signed_in}' checkbox")
+        if not page.click_text(args.button):
+            return fail(f"no '{args.button}' button")
+        state, _ = wait_for(page, args.user, args.dismiss, args.timeout)
+        if state != "signed-in":
+            page.navigate(args.url)
+            state, _ = wait_for(page, args.user, args.dismiss, args.timeout)
+        if state != "signed-in":
+            return fail(page.message() or f"{args.user} didn't show after signing in")
+        if project:
+            _remove(failed)
+        return {"state": "signed-in", "user": args.user, "signed_in_now": True}
+    finally:
+        if own:
+            passhand.close()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="autopilot-browser", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start", help="launch the browser host")
+    s.add_argument("--project", required=True, help="the project config's name")
+    s.add_argument("--web-url", required=True, help="preprod.web_url: its host is allowed")
+    s.add_argument("--api-host", action="append", default=[], help="preprod.api_hosts (repeat)")
+    s.add_argument("--allow-host", action="append", default=[], help="preprod.browser_host.allow_hosts (repeat)")
+    s.add_argument("--forbidden-host", action="append", default=[], help="forbidden.hosts (repeat)")
+    s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.add_argument("--passhand", action="store_true", help="load Passhand's extension and native host")
+    s.add_argument("--chromium", help="the Chromium binary (default: Playwright's newest, or $AUTOPILOT_CHROMIUM)")
+    sub.add_parser("status", help="is it running, and its CDP endpoint")
+    sub.add_parser("stop", help="close it and everything it started")
+    g = sub.add_parser("sign-in", help="make sure the test user is signed in there")
+    g.add_argument("--url", required=True, help="the page to open, e.g. preprod.keepalive.url")
+    g.add_argument("--user", required=True, help="the name that shows on that page when signed in")
+    g.add_argument("--username", help="the account saved in Passhand, if not --user")
+    g.add_argument("--passhand", action="store_true", help="sign in with Passhand on a login form")
+    g.add_argument("--dismiss", action="append", default=[], help="text of a first-run prompt's button (repeat)")
+    g.add_argument("--button", default="Sign in", help="the sign-in button's text")
+    g.add_argument("--next-button", default="Next", help="a two-step login's Next button")
+    g.add_argument("--keep-signed-in", help="label of a 'keep me signed in' checkbox to tick")
+    g.add_argument("--project", help="for <project>.signin-failed (default: the one it was started for)")
+    g.add_argument("--timeout", type=int, default=20, help="seconds to wait for each page")
+    args = p.parse_args(argv)
+    try:
+        if args.cmd == "status":
+            out = status()
+            code = 0 if out["running"] and out.get("cdp") else 3
+        elif args.cmd == "start":
+            out, code = start(args), 0
+        elif args.cmd == "stop":
+            out, code = stop(args), 0
+        else:
+            out, code = sign_in(args)
+    except Fail as e:
+        out, code = {"error": str(e)}, e.code
+    print(json.dumps(out, indent=1))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -63,6 +63,21 @@ class ConfigSchemaTests(unittest.TestCase):
                     jsonschema.validate(cfg, schema)
 
 
+    def test_preprod_browser_host(self):
+        schema = json.loads((ROOT / "schema" / "autopilot.schema.json").read_text())
+        cfg = yaml.safe_load((ROOT / "examples" / "web-app" / "autopilot.yaml").read_text())
+        self.assertNotIn("browser_host", cfg["preprod"])  # opt-in: the example leaves it commented out
+        cfg["preprod"]["browser_host"] = {"user": "test-user", "port": 9333, "allow_hosts": ["cdn.example.net"],
+                                          "dismiss": ["Maybe Later"], "sign_in_button": "Sign In"}
+        jsonschema.validate(cfg, schema)
+        cfg["preprod"]["browser_host"] = {}
+        jsonschema.validate(cfg, schema)
+        for bad in ({"port": 80}, {"dismiss": "Maybe Later"}, {"profile": "/tmp/x"}):
+            with self.subTest(browser_host=bad):
+                cfg["preprod"]["browser_host"] = bad
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(cfg, schema)
+
 def _linear_schema():
     path = os.environ.get("LINEAR_SCHEMA")
     if path:

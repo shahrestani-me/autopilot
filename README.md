@@ -52,6 +52,7 @@ Merges reach preprod only; prod is released by hand. Setting it up for a company
 | `bin/autopilot-coder` | The implementation step on a non-Claude model through OpenRouter, contained to the worktree; also the shared OpenRouter config and spend ledger |
 | `bin/autopilot-fallback` | API mode: the supervisor that runs Autopilot on OpenRouter, a model per role, under per-ticket and daily caps; the switch, the settings and the launchd tick |
 | `bin/autopilot-stream` | Hook: mirrors a run live into its issue's Linear agent session, every message and tool call, headed by the agent that runs it; only in sessions holding an Autopilot issue lock |
+| `bin/autopilot-browser` | The browser host: one Chromium of Autopilot's own for CDP drivers (Playwright MCP), only preprod's hosts resolve there, signed in with Passhand; `start`, `status`, `stop`, `sign-in` ([setup](docs/setup.md#6-browser-host-for-cdp-drivers-optional-since-0180)) |
 | `bin/autopilot-runstate` | Hook: after a Claude usage limit or outage, frees the run's issue and slot; on a subscription limit, switches to API mode |
 | `bin/autopilot-github-setup` | owner-run: creates the GitHub App from a manifest, stores its secrets |
 | `bin/autopilot-gateway-setup` | owner-run: stores the gateway's secrets in Keychain and as Worker secrets |
@@ -212,6 +213,18 @@ bin/autopilot-coder run --model ID --cwd WORKTREE --max-usd N [--timeout-min 60]
                                                             # minutes long: start it in the background
 ```
 
+### autopilot-browser (the browser host, since 0.18.0)
+
+```bash
+bin/autopilot-browser start --project P --web-url URL [--api-host H]... [--allow-host H]... [--forbidden-host H]... [--port 9333] [--passhand]
+bin/autopilot-browser status                # running, pid, cdp_endpoint, helpers, playwright_mcp_args; exit 3 when not running
+bin/autopilot-browser sign-in --url URL --user U [--username N] [--passhand] [--dismiss TEXT]... [--button TEXT]
+bin/autopilot-browser stop                  # ends Chromium and everything it started
+```
+
+Exit 3 means the owner is needed (not running, signed out, sign-in failed or not tried). See
+[setup](docs/setup.md#6-browser-host-for-cdp-drivers-optional-since-0180).
+
 ### Setup scripts (owner-run, in your own Terminal)
 
 ```bash
@@ -241,6 +254,7 @@ State, in `~/.local/state/autopilot/`:
 | `fallback.lock` | the supervisor holds it while it runs (with its pid) |
 | `fallback-giveup.json` | the supervisor gave up; it isn't restarted until the queue changes or 6 hours pass |
 | `openrouter-spend.json` | the spend ledger: per UTC day, by source (`api_mode`, `coder`) |
+| `browser-host/` | the browser host's profile, `host.json` (what `start` launched) and `chromium.log` |
 | `slots/`, `locks/` | run slots and issue / `verify` / `keepalive` locks |
 | `waiting/<ID>.json` | a recorded block and what unblocks it |
 | `runs/`, `streams/`, `current-jobs/`, `attempts/` | per-run hook state, claimed jobs, attempt counts |
@@ -261,6 +275,7 @@ State, in `~/.local/state/autopilot/`:
 | `AUTOPILOT_GATEWAY` | | `off`: poll Linear instead of the gateway |
 | `AUTOPILOT_GATEWAY_URL` | | a local `wrangler dev` gateway (localhost only) |
 | `AUTOPILOT_STREAM` | | `0`: no live mirror into Linear |
+| `AUTOPILOT_CHROMIUM` | Playwright's newest Chromium | the browser host's Chromium binary |
 | `AUTOPILOT_CLAUDE_BIN` | `claude` on PATH, else `~/.local/bin/claude` | the CLI the coder and API-mode runs start |
 | `AUTOPILOT_LINEAR_SCOPES` | `read,write,app:assignable,app:mentionable` | scopes of the app token |
 | `AUTOPILOT_FALLBACK`, `AUTOPILOT_CODER_MODEL`, `AUTOPILOT_FALLBACK_USD` | | set by the supervisor inside an API-mode run; don't set them yourself |
