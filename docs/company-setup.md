@@ -254,7 +254,7 @@ before the webhook secret reached the Worker, shows an error; that's expected.)
    | `linear` | the team key, the Linear projects Autopilot takes issues from, your workflow state names, the owner who answers questions |
    | `repos` | each repo's GitHub name, local clone path, setup and check commands, house rules and notes |
    | `merge` | merge policy, review depth, review model |
-   | `preprod` | the preprod URL, test users, and how to verify a change in a browser |
+   | `preprod` | the preprod URL, test users, and how to verify a change in a browser; optionally `sign_in`, so runs sign a test user back in with Passhand ([setup](setup.md#5-preprod-sign-in-with-passhand-optional-since-0170)) |
    | `forbidden` | production hosts, cloud projects, commands and workflows it must never touch |
    | `spend` | the most a ticket may spend on paid models |
 
@@ -327,3 +327,5 @@ secrets).
 - The GitHub App is installed on selected repositories only.
 - Every project config lists its production hosts, cloud projects and release commands under `forbidden`.
 - The Mac's user account is the trust boundary: anyone who can use it can act as Autopilot.
+- Passhand logins marked `auto` (for `preprod.sign_in`) are preprod test accounts only, never a personal
+  or production account.

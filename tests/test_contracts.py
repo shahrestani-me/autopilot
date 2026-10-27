@@ -47,6 +47,21 @@ class ConfigSchemaTests(unittest.TestCase):
         self.assertFalse(cfg["git"]["ticket_id_in_branch_or_title"])
         self.assertLessEqual(cfg["spend"]["paid_model_usd_per_ticket"], 1)
 
+    def test_preprod_sign_in(self):
+        schema = json.loads((ROOT / "schema" / "autopilot.schema.json").read_text())
+        cfg = yaml.safe_load((ROOT / "examples" / "web-app" / "autopilot.yaml").read_text())
+        self.assertNotIn("sign_in", cfg["preprod"])  # opt-in: the example leaves it commented out
+        cfg["preprod"]["sign_in"] = {"with": "passhand", "user": "test-user", "keep_signed_in": "Keep me logged in"}
+        jsonschema.validate(cfg, schema)
+        cfg["preprod"]["sign_in"] = {"with": "passhand"}  # user defaults to keepalive.user
+        jsonschema.validate(cfg, schema)
+        for bad in ({"user": "test-user"}, {"with": "typing", "user": "test-user"},
+                    {"with": "passhand", "user": "test-user", "password": "x"}):
+            with self.subTest(sign_in=bad):
+                cfg["preprod"]["sign_in"] = bad
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(cfg, schema)
+
 
 def _linear_schema():
     path = os.environ.get("LINEAR_SCHEMA")

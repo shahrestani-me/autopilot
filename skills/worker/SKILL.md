@@ -375,8 +375,10 @@ for the browser", `wait: checkable`. In an API-mode run without the browser tool
   Open `preprod.web_url` in a new tab and hard-reload.
 - Confirm the environment: network calls must go to `preprod.api_hosts`. Anything on
   `forbidden.hosts` → stop and block.
-- Check who is signed in. Login screen or the wrong user → block with "needs sign-in on
-  <web_url> as <user>". **Never type a password** and never sign out.
+- Check who is signed in. Login screen and `preprod.sign_in` set → sign in with Passhand (orchestrator
+  section 1c, which also closes a stale sign-in notice); signed in now → carry on. Otherwise, or the
+  wrong user → block with "needs sign-in on <web_url> as <user>", plus 1c's reason ("not tried" or failed).
+  **Never type a password** and never sign out.
 - Drive the app like a user; follow **every** `preprod.recipes` line. Check console messages and network
   responses. Never read tokens or cookies from the page to call an API yourself.
 - A click or step refused by the permission check: stop and block with the refusal text. Don't retry

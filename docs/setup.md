@@ -270,3 +270,51 @@ every 10 minutes and starts another run while a slot is free and there's work no
 (`--queued` leaves out the jobs running runs hold; `inflight count` leaves out issues a run has locked). `KEEPALIVE-DUE` wakes an idle run when a config
 with `preprod.keepalive` has no stamp, or one older than 20 hours (orchestrator section 1b). It finds
 configs by file name, so name each file `<config name>.yaml`.
+
+## 5. Preprod sign-in with Passhand (optional, since 0.17.0)
+
+Without it, a run that finds the preprod login screen asks you to sign in (a sign-in notice in Linear),
+and verification waits until you do. That happens every time the session ends, e.g. once a week on
+an app whose sessions can't refresh. With `preprod.sign_in`, the run signs the test user back in with
+[Passhand](https://github.com/shahrestani-me/passhand) and only asks you when that fails
+(orchestrator section 1c).
+
+Passhand fills a login saved on this Mac straight into the page in Chrome, chosen by the tab's real
+origin. Autopilot calls its `fill_login` tool and never sees the password: it isn't in the chat, the
+logs, Linear or the reports.
+
+Set up once:
+
+1. Install Passhand and its Chrome extension ([its README](https://github.com/shahrestani-me/passhand#install)),
+   then restart the Claude app so the runs get its `fill_login` tool.
+2. Save the test user's login and mark it `auto` (Terminal: it asks for the password without echoing it,
+   and `--auto` asks for Touch ID):
+
+   ```bash
+   passhand add <preprod host> <test user's username> --auto
+   ```
+
+   `auto` fills without Touch ID, which a run needs because nobody is at the Mac; runs check it with
+   `list_saved_logins` and don't fill a login that isn't `auto`
+   ([Passhand on unattended logins](https://github.com/shahrestani-me/passhand#unattended-logins-test-and-qa-accounts)). Use it for **preprod
+   test accounts only**: never a personal or production account, and never on a `forbidden.hosts` host.
+   Accounts with 2FA or a passkey can't be signed in this way, nor a login form on another host than
+   `preprod.web_url`'s (a separate identity provider): runs only fill on the preprod host itself.
+3. In the project config:
+
+   ```yaml
+   preprod:
+     browser: chrome
+     sign_in:
+       with: passhand
+       user: test-user                     # a test_users name; default: keepalive.user
+       username: test-user@example.com     # the username saved in Passhand, if it isn't the name
+       keep_signed_in: Keep me logged in   # a checkbox to tick, if the login form has one
+   ```
+
+4. Keep the Mac awake and logged in, and Chrome open with the extension enabled.
+
+Day to day: a failed sign-in writes `~/.local/state/autopilot/<config name>.signin-failed`, and runs
+don't try again for 20 hours, so a wrong or missing login can't lock the account. The sign-in notice
+then quotes Passhand's message. Fix the login (`passhand list`, `passhand add …`, `passhand auto …`) or
+sign in by hand; the next keep-alive that finds the user signed in deletes the file and closes the notice.
