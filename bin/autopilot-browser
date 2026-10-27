@@ -94,7 +94,12 @@ def allowed_hosts(web_url, api_hosts=(), extra=(), forbidden=()):
         if h not in hosts:
             hosts.append(h)
     banned = {host_of(f) for f in forbidden}
-    clash = [h for h in hosts if h in banned]
+    covers = lambda a, b: a == b or (a.startswith("*.") and b.endswith(a[1:]))  # noqa: E731
+    clash = [h for h in hosts if any(covers(h, f) or covers(f, h) for f in banned)]
+    local = [h for h in hosts if h in ("localhost", "*.localhost") or h.endswith(".localhost")
+             or re.match(r"^127\.\d+\.\d+\.\d+$", h)]
+    if local:  # a page there could reach the browser's own CDP port
+        raise Fail(f"the browser host never allows loopback hosts: {', '.join(local)}", 2)
     if clash:
         raise Fail(f"allowed and forbidden at once: {', '.join(clash)}. Fix the project config.", 2)
     return hosts
@@ -111,6 +116,8 @@ def chromium_args(profile, port, hosts, extensions=()):
         f"--remote-debugging-port={port}",
         "--remote-debugging-address=127.0.0.1",
         f"--host-resolver-rules={resolver_rules(hosts)}",
+        "--no-proxy-server",  # a system proxy would resolve hosts for it, around the rules above
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",
@@ -149,10 +156,14 @@ def ps():
     return procs
 
 
-def find_main(procs, profile=PROFILE):
-    """The browser's main process: uses this profile, and its parent doesn't (helpers' parents do)."""
-    flag = f"--user-data-dir={profile}"
-    users = {pid for pid, (_, cmd) in procs.items() if flag in cmd and " --type=" not in cmd}
+def find_main(procs, profile=PROFILE, exe=None):
+    """The browser's main process: the Chromium that start launched, on this profile, whose parent isn't."""
+    exe = exe if exe is not None else read_host().get("chromium")
+    if not exe:
+        return None  # start never ran here: nothing is ours to report or end
+    flag = f"--user-data-dir={profile} "  # the whole value: not another profile that starts with this path
+    users = {pid for pid, (_, cmd) in procs.items()
+             if cmd.split(" --", 1)[0].endswith(exe) and flag in cmd + " " and " --type=" not in cmd}
     roots = [pid for pid in users if procs[pid][0] not in users]
     return min(roots) if roots else None
 
@@ -339,8 +350,9 @@ const vis = e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e);
   return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
 const findText = text => {
   const want = text.trim().toLowerCase();
-  const all = [...document.querySelectorAll('body *')].filter(e =>
-    (e.tagName === 'INPUT' ? (e.value || '') : (e.innerText || '')).trim().toLowerCase() === want && vis(e));
+  const all = [...document.querySelectorAll('body *')].filter(e => e.tagName === 'INPUT'
+    ? (e.value || '').trim().toLowerCase() === want && vis(e)
+    : (e.textContent || '').toLowerCase().includes(want) && (e.innerText || '').trim().toLowerCase() === want && vis(e));
   const inner = all.filter(e => !all.some(o => o !== e && e.contains(o)));
   const clickable = e => { for (let n = e, i = 0; n && i < 4; n = n.parentElement, i++) {
     if (n.matches('button,a,input,[role=button],[role=link],[role=checkbox],[tabindex]') ||
@@ -374,6 +386,8 @@ class Page:
         return r.get("result", {}).get("value")
 
     def navigate(self, url):
+        # Marks the old document, so probe() can tell it from the new one until the navigation commits.
+        self.evaluate("window.__autopilotOld = true")
         self.cdp.send("Page.navigate", {"url": url})
 
     def href(self):
@@ -386,7 +400,7 @@ const text = document.body ? document.body.innerText : '';
 const esc = a0.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const fields = sel => [...document.querySelectorAll(sel)].some(vis);
 return {
-  ready: document.readyState === 'complete',
+  ready: document.readyState === 'complete' && !window.__autopilotOld,
   password: fields('input[type=password]'),
   username_field: fields('input[type=email],input[autocomplete~=username],input[name*=user i],input[name*=email i]'),
   user: a0 !== '' && new RegExp('(^|[^\\w@.-])' + esc + '($|[^\\w@.-])', 'i').test(text),
@@ -450,9 +464,14 @@ class Passhand:
         self.proc = subprocess.Popen([binary, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL)
         self.buf, self.next_id = b"", 0
-        self._call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                  "clientInfo": {"name": "autopilot-browser", "version": "1"}})
-        self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        try:
+            self._call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "autopilot-browser", "version": "1"}})
+            self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except (Fail, OSError):
+            self.proc.kill()
+            self.proc.wait()
+            raise
 
     def _write(self, msg):
         self.proc.stdin.write((json.dumps(msg) + "\n").encode())
@@ -540,7 +559,8 @@ class host_lock:
     """One start or stop at a time on this Mac."""
 
     def __enter__(self):
-        os.makedirs(HOST_DIR, exist_ok=True)
+        os.makedirs(HOST_DIR, mode=0o700, exist_ok=True)
+        os.chmod(HOST_DIR, 0o700)  # the profile holds the test user's session
         self.f = open(os.path.join(HOST_DIR, "lock"), "w")
         fcntl.flock(self.f, fcntl.LOCK_EX)
         return self
@@ -622,12 +642,16 @@ def start(args):
             host = read_host()
             if host.get("project") == args.project and host.get("allow_hosts") == hosts \
                     and host.get("port") == args.port and bool(host.get("passhand")) == args.passhand:
-                return {"started": False, "already_running": True, **status(procs)}
-            raise Fail(f"the browser host already runs for {host.get('project') or 'another project'} with other "
-                       "settings: stop it first", 1)
+                if cdp_version(args.port) is not None:
+                    return {"started": False, "already_running": True, **status(procs)}
+                if stop_browser().get("left"):  # running but its CDP is dead: start it afresh
+                    raise Fail("the browser host hangs and could not be ended", 1)
+            else:
+                raise Fail(f"the browser host already runs for {host.get('project') or 'another project'} with "
+                           "other settings: stop it first", 1)
         if cdp_version(args.port) is not None:
             raise Fail(f"port {args.port} already serves another browser's CDP; pass --port", 1)
-        os.makedirs(PROFILE, exist_ok=True)
+        os.makedirs(PROFILE, mode=0o700, exist_ok=True)
         if args.passhand:
             hosts_dir = os.path.join(PROFILE, "NativeMessagingHosts")
             os.makedirs(hosts_dir, exist_ok=True)
@@ -657,8 +681,10 @@ def stop_browser():
     if main is None:
         return {"stopped": False, "running": False}
     family = descendants(procs, main)
-    port = read_host().get("port", DEFAULT_PORT)
-    version, closing = cdp_version(port), False
+    host = read_host()
+    port = host.get("port", DEFAULT_PORT)
+    # Only the browser start launched gets Browser.close: the port could be another browser's now.
+    version, closing = (cdp_version(port) if host.get("pid") == main else None), False
     if version and version.get("webSocketDebuggerUrl"):  # a clean close saves the profile
         try:
             cdp = Cdp(version["webSocketDebuggerUrl"], timeout=5)
@@ -673,12 +699,15 @@ def stop_browser():
             signal_all([main], signal.SIGKILL)
             wait_gone([main], 5)
     # Whatever the browser started and outlived it, e.g. a native host that didn't see stdin close.
-    left = [p for p in family if alive(p) and procs.get(p) and ps().get(p, (None, None))[1] == procs[p][1]]
+    same = lambda now, pid: now.get(pid, (None, None))[1] == procs[pid][1]  # not a new process on a reused pid  # noqa: E731
+    now = ps()
+    left = [p for p in family if alive(p) and same(now, p)]
     signal_all(left, signal.SIGTERM)
     if not wait_gone(left, 3):
         signal_all(left, signal.SIGKILL)
         wait_gone(left, 3)
-    remaining = [p for p in [main, *family] if alive(p) and ps().get(p, (None, None))[1] == procs[p][1]]
+    now = ps()
+    remaining = [p for p in [main, *family] if alive(p) and same(now, p)]
     return {"stopped": not remaining, "pid": main, "ended": len(family) + 1,
             "native_hosts": native_hosts(procs, family), "left": remaining}
 
@@ -691,8 +720,9 @@ def stop(args):
     return out
 
 
-def wait_for(page, user, dismiss, seconds):
-    """Poll until the page shows the user or a login form, clicking away `dismiss` prompts meanwhile."""
+def wait_for(page, user, dismiss, seconds, after_click=False):
+    """Poll until the page shows the user or a login form, clicking away `dismiss` prompts meanwhile.
+    `after_click`: right after the sign-in button, wait for the user only (a slow server keeps the form up)."""
     deadline, last = time.time() + seconds, {}
     while time.time() < deadline:
         for text in dismiss:
@@ -700,12 +730,15 @@ def wait_for(page, user, dismiss, seconds):
                 page.click_text(text)
                 time.sleep(0.5)
         last = page.probe(user) or {}
-        if last.get("user") and not last.get("password"):
+        if last.get("ready") and last.get("user") and not last.get("password"):
             return "signed-in", last
+        if after_click:  # the sign-in request may still be on its way: only the user counts
+            time.sleep(0.5)
+            continue
         if last.get("ready") and (last.get("password") or last.get("username_field")):
             time.sleep(1)  # a login form can flash while the app restores its session
             again = page.probe(user) or {}
-            if again.get("user") and not again.get("password"):
+            if again.get("ready") and again.get("user") and not again.get("password"):
                 return "signed-in", again
             if again.get("password") or again.get("username_field"):
                 return "login", again
@@ -717,12 +750,12 @@ def sign_in(args, page=None, passhand=None, now=None):
     """Make sure `args.user` is signed in on `args.url` in the browser host. Returns (result, exit code)."""
     host = read_host()
     project = args.project or host.get("project")
+    if page is None and find_main(ps()) is None:
+        return {"state": "not-running", "reason": "the browser host isn't running: start it first"}, 3
     url_host = host_of(args.url)
     if url_host not in host.get("allow_hosts", []) or url_host in host.get("forbidden_hosts", []):
         raise Fail(f"{url_host} isn't one of the browser host's allowed hosts", 2)
     if page is None:
-        if find_main(ps()) is None:
-            return {"state": "not-running", "reason": "the browser host isn't running: start it first"}, 3
         page = Page(host.get("port", DEFAULT_PORT))
     keep_tab = False
     try:
@@ -754,8 +787,10 @@ def _remove(path):
 
 
 def _passhand_sign_in(args, page, project, passhand, seen, now):
-    failed = signin_failed_file(project) if project else None
-    if failed and os.path.exists(failed) and now - os.path.getmtime(failed) < SIGNIN_RETRY_S:
+    if not project:
+        return {"state": "not-tried", "reason": "no project for the 20-hour sign-in-failed gate: pass --project"}
+    failed = signin_failed_file(project)
+    if os.path.exists(failed) and now - os.path.getmtime(failed) < SIGNIN_RETRY_S:
         return {"state": "not-tried", "reason": "a sign-in failed less than 20 hours ago"}
     name = args.username or args.user
     own = passhand is None
@@ -773,16 +808,23 @@ def _passhand_sign_in(args, page, project, passhand, seen, now):
         rows = [r for r in passhand.saved_logins() if r[0] == origin and r[1] == name]
         if not rows:
             return {"state": "not-tried", "reason": f"no saved login for {name} on {origin}"}
-        if rows[0][2] not in (None, "auto"):
+        if rows[0][2] != "auto":  # a Passhand that serves several browsers always says the mode
             return {"state": "not-tried", "reason": "the login isn't auto, so Passhand would wait for Touch ID"}
 
         def fail(reason):
-            if failed:
-                with open(failed, "w") as f:
-                    f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
             return {"state": "failed", "reason": reason}
 
-        text, is_error = passhand.fill(href, name)
+        # The attempt counts from here, whatever ends it (even a crash): only success removes the file.
+        with open(failed, "w") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+
+        def fill(url):  # a fill that times out may have filled: it counts as the attempt
+            try:
+                return passhand.fill(url, name)
+            except Fail as e:
+                return str(e), True
+
+        text, is_error = fill(href)
         if is_error or not text.startswith("Filled"):
             return fail(text or "Passhand filled nothing")
         if text.startswith("Filled only the username"):  # two-step login: Next, then the password page
@@ -791,21 +833,23 @@ def _passhand_sign_in(args, page, project, passhand, seen, now):
             deadline = time.time() + args.timeout
             while time.time() < deadline and not (page.probe(args.user) or {}).get("password"):
                 time.sleep(0.5)
-            text, is_error = passhand.fill(page.href(), name)
+            href = page.href()
+            if host_of(href) != host_of(args.url):
+                return fail(f"the password page is on {host_of(href)}, not {host_of(args.url)}")
+            text, is_error = fill(href)
             if is_error or not text.startswith("Filled the"):
                 return fail(text or "Passhand filled no password")
         if args.keep_signed_in and page.tick(args.keep_signed_in) == "missing":
             return fail(f"no '{args.keep_signed_in}' checkbox")
         if not page.click_text(args.button):
             return fail(f"no '{args.button}' button")
-        state, _ = wait_for(page, args.user, args.dismiss, args.timeout)
+        state, _ = wait_for(page, args.user, args.dismiss, args.timeout, after_click=True)
         if state != "signed-in":
             page.navigate(args.url)
             state, _ = wait_for(page, args.user, args.dismiss, args.timeout)
         if state != "signed-in":
             return fail(page.message() or f"{args.user} didn't show after signing in")
-        if project:
-            _remove(failed)
+        _remove(failed)
         return {"state": "signed-in", "user": args.user, "signed_in_now": True}
     finally:
         if own:
@@ -850,6 +894,8 @@ def main(argv=None):
             out, code = sign_in(args)
     except Fail as e:
         out, code = {"error": str(e)}, e.code
+    except (OSError, ValueError) as e:  # CDP or Passhand went away mid-call (URLError and timeouts are OSErrors)
+        out, code = {"error": f"{type(e).__name__}: {e}"}, 1
     print(json.dumps(out, indent=1))
     return code
 

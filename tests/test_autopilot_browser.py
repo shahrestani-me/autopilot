@@ -91,6 +91,22 @@ class HostTests(Base):
             self.ab.allowed_hosts("https://staging.example.com", ["api.example.com"], [], ["API.example.com"])
         self.assertEqual(e.exception.code, 2)
 
+    def test_a_wildcard_may_not_cover_a_forbidden_host(self):
+        with self.assertRaises(self.ab.Fail):
+            self.ab.allowed_hosts("https://staging.example.com", [], ["*.example.com"], ["api.example.com"])
+        self.assertEqual(self.ab.allowed_hosts("https://staging.example.com", [], ["*.cdn.example.net"],
+                                               ["api.example.com"]), ["staging.example.com", "*.cdn.example.net"])
+
+    def test_a_forbidden_wildcard_covers_an_allowed_host_too(self):
+        with self.assertRaises(self.ab.Fail):
+            self.ab.allowed_hosts("https://staging.example.com", ["api.example.com"], [], ["*.example.com"])
+
+    def test_loopback_is_never_allowed(self):
+        for h in ("localhost", "app.localhost", "127.0.0.1"):
+            with self.subTest(host=h), self.assertRaises(self.ab.Fail) as e:
+                self.ab.allowed_hosts("https://staging.example.com", [], [h])
+            self.assertEqual(e.exception.code, 2)
+
     def test_bad_host_names_are_refused(self):
         for bad in ("", "exa mple.com", "staging.example.com,evil.com", "-x.example.com"):
             with self.subTest(bad=bad), self.assertRaises(self.ab.Fail):
@@ -106,6 +122,7 @@ class HostTests(Base):
         self.assertIn("--remote-debugging-address=127.0.0.1", args)
         self.assertIn("--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE a.example.com", args)
         self.assertFalse([a for a in args if "extension" in a])
+        self.assertIn("--no-proxy-server", args)
         args = self.ab.chromium_args("/p", 9333, ["a.example.com"], ["/ext"])
         self.assertIn("--load-extension=/ext", args)
         self.assertIn("--disable-extensions-except=/ext", args)
@@ -130,8 +147,13 @@ class ProcessTests(Base):
     }
 
     def test_finds_the_main_process_of_this_profile_only(self):
-        self.assertEqual(self.ab.find_main(self.PROCS, "/p"), 10)
-        self.assertIsNone(self.ab.find_main(self.PROCS, "/missing"))
+        self.assertEqual(self.ab.find_main(self.PROCS, "/p", "/x/Chromium"), 10)
+        self.assertIsNone(self.ab.find_main(self.PROCS, "/missing", "/x/Chromium"))
+        self.assertIsNone(self.ab.find_main(self.PROCS, "/oth", "/x/Chromium"))  # a prefix of /other is another profile
+        procs = {40: (1, "/x/Chromium --user-data-dir=/p2 about:blank"),
+                 41: (1, "pgrep -f --user-data-dir=/p"), 42: (1, "/other/Chromium --user-data-dir=/p")}
+        self.assertIsNone(self.ab.find_main(procs, "/p", "/x/Chromium"))  # only our binary on this profile
+        self.assertIsNone(self.ab.find_main(self.PROCS, "/p", ""))  # start never ran
 
     def test_descendants_and_native_hosts(self):
         family = self.ab.descendants(self.PROCS, 10)
@@ -208,18 +230,24 @@ class PasshandTests(Base):
 class FakePage:
     """The page as sign_in sees it: a login form until the sign-in button is clicked."""
 
-    def __init__(self, signed_in=False, form=True, two_step=False, sign_in_works=True):
+    def __init__(self, signed_in=False, form=True, two_step=False, sign_in_works=True, slow=0):
         self.signed_in, self.form, self.two_step, self.works = signed_in, form, two_step, sign_in_works
         self.clicks, self.closed, self.url = [], False, None
         self.step = 1
+        self.slow, self.pending = slow, None  # probes the form stays up after Sign in, like a slow server
 
     def navigate(self, url):
         self.url = url
+        self.navigations = getattr(self, "navigations", 0) + 1
 
     def href(self):
         return "https://staging.example.com/login"
 
     def probe(self, user):
+        if self.pending is not None:
+            self.pending -= 1
+            if self.pending <= 0:
+                self.signed_in, self.pending = True, None
         if self.signed_in:
             return {"ready": True, "password": False, "username_field": False, "user": True}
         if not self.form:
@@ -235,7 +263,10 @@ class FakePage:
         if text == "Next":
             self.step = 2
         if text == "Sign in" and self.works:
-            self.signed_in = True
+            if self.slow:
+                self.pending = self.slow
+            else:
+                self.signed_in = True
         return True
 
     def tick(self, label):
@@ -296,6 +327,28 @@ class SignInTests(Base):
         self.assertEqual(ph.fills, [("https://staging.example.com/login", "test-user")])
         self.assertFalse(self.failed.exists())
 
+    def test_a_slow_sign_in_is_waited_for_not_failed(self):
+        page = FakePage(slow=4)  # the form stays up ~2 s after the click
+        out, code = self.ab.sign_in(self.args(timeout=4), page=page, passhand=FakePasshand())
+        self.assertEqual((out["state"], code), ("signed-in", 0))
+        self.assertEqual(page.navigations, 1)  # never reloaded under a sign-in on its way
+        self.assertFalse(self.failed.exists())
+
+    def test_a_passhand_error_during_the_fill_counts_as_the_attempt(self):
+        class Hanging(FakePasshand):
+            def fill(self, page_url, username):
+                raise self_ab.Fail("Passhand tools/call: no answer in 150 s")
+        self_ab = self.ab
+        out, code = self.ab.sign_in(self.args(), page=FakePage(), passhand=Hanging())
+        self.assertEqual((out["state"], code), ("failed", 3))
+        self.assertTrue(self.failed.exists())
+
+    def test_not_running_comes_before_the_allowlist(self):
+        os.remove(self.ab.HOST_FILE)
+        self.ab.find_main = lambda procs, profile=None: None
+        out, code = self.ab.sign_in(self.args())
+        self.assertEqual((out["state"], code), ("not-running", 3))
+
     def test_two_step_login_clicks_next_and_fills_again(self):
         page, ph = FakePage(two_step=True), FakePasshand()
         ph.two_step = True
@@ -317,6 +370,25 @@ class SignInTests(Base):
         self.assertEqual((out["state"], code), ("not-tried", 3))
         self.assertEqual(ph.fills, [])
         self.assertFalse(self.failed.exists())
+
+    def test_a_login_without_a_fill_mode_is_not_tried(self):
+        out, _ = self.ab.sign_in(self.args(), page=FakePage(), passhand=FakePasshand(mode=None))
+        self.assertEqual(out["state"], "not-tried")
+
+    def test_passhand_needs_a_project_for_the_gate(self):
+        self.ab.write_host({"port": free_port(), "allow_hosts": ["staging.example.com"]})
+        ph = FakePasshand()
+        out, _ = self.ab.sign_in(self.args(), page=FakePage(), passhand=ph)
+        self.assertEqual(out["state"], "not-tried")
+        self.assertEqual(ph.fills, [])
+
+    def test_an_attempt_that_crashes_still_counts(self):
+        class Crashing(FakePage):
+            def tick(self, label):
+                raise OSError("CDP went away")
+        with self.assertRaises(OSError):
+            self.ab.sign_in(self.args(keep_signed_in="Keep me"), page=Crashing(), passhand=FakePasshand())
+        self.assertTrue(self.failed.exists())
 
     def test_no_saved_login_for_the_username_is_not_tried(self):
         out, _ = self.ab.sign_in(self.args(username="someone-else"), page=FakePage(), passhand=FakePasshand())

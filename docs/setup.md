@@ -332,9 +332,10 @@ preprod test user between runs.
   Chromium is started directly, not through a Node launcher, and `stop` ends the browser and everything
   it started (renderers, Passhand's native host).
 - **Only preprod resolves there.** The browser's own resolver fails every host except `preprod.web_url`'s,
-  `preprod.api_hosts` and `browser_host.allow_hosts`, IP addresses included, so a `forbidden.hosts`
-  host is unreachable whatever a page, driver or model asks for. A host that is both allowed and
-  forbidden is a config error and the browser doesn't start. `status` also prints Playwright MCP's
+  `preprod.api_hosts` and `browser_host.allow_hosts`, IP addresses included, and it uses no proxy, so a
+  `forbidden.hosts` host is unreachable whatever a page, driver or model asks for. A host that is both
+  allowed and forbidden is a config error and the browser doesn't start; so is a wildcard
+  (`*.cdn.example.net`) on one side that covers a host on the other. `status` also prints Playwright MCP's
   `--allowed-origins` for the same hosts.
 - **Signing in.** With `preprod.sign_in`, Passhand's extension and native host are loaded into the
   profile (its `NativeMessagingHosts/` folder: nothing global changes), and `sign-in` fills the test
@@ -343,6 +344,11 @@ preprod test user between runs.
   `browser_host.dismiss` prompts first: a fresh profile may show an app's install banner, which blocks
   clicks until it's dismissed. The keep-alive (orchestrator section 1b) starts the browser and runs
   `sign-in` every 20 hours.
+- **CDP is a local, unauthenticated full control of that browser.** Anything running as you on this Mac
+  can connect to `127.0.0.1:<port>` and drive it, signed in as the test user; a driver can also open
+  `file://` pages. So keep it to preprod test accounts, keep the Mac's user account to yourself, and
+  stop it when you don't need it. Loopback hosts are never allowed, so a page can't reach the port.
+  The state folder is private to you (0700): the profile holds the session.
 - **Use a test user of its own** (`browser_host.user`). One user's sessions in two browsers can end each
   other: a sign-out in either can revoke them all, an app may keep only a few live sessions per user,
   and a password reset ends them all. If it has to be the same user as the owner's Chrome, the browser

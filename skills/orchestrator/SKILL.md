@@ -188,6 +188,8 @@ every 10-minute run would retry it.
 4b. **Browser host** (only with `preprod.browser_host`), still holding both locks. It's a Chromium of
    Autopilot's own that drivers connect to over CDP; `AB` = `${CLAUDE_PLUGIN_ROOT}/bin/autopilot-browser`,
    which prints JSON and drives the page itself, so this needs no browser tools. `BH` = `browser_host`.
+   Put every value from the config in **single quotes** (a `'` inside one becomes `'\''`), never double
+   quotes, so nothing in it is run by the shell.
    - Start it (does nothing when it already runs with these settings): `"$AB" start --project <config name>
      --web-url <web_url>`, plus `--api-host H` per `api_hosts`, `--allow-host H` per `BH.allow_hosts`,
      `--forbidden-host H` per `forbidden.hosts`, `--port <BH.port>` if set, and `--passhand` with
@@ -195,10 +197,12 @@ every 10-minute run would retry it.
      one report line with its `error`, and skip the rest of 4b.
    - Then `"$AB" sign-in --url <keepalive.url> --user <BU>`, with `BU` = `BH.user`, else `sign_in.user`,
      else `keepalive.user`; `--username <BH.username>` if set, else `--username <sign_in.username>` when
-     `BU` is `sign_in`'s user; `--dismiss "<text>"` per `BH.dismiss`; `--button "<BH.sign_in_button>"`
-     and `--next-button "<BH.next_button>"` if set; and with `preprod.sign_in`: `--passhand`, plus
-     `--keep-signed-in "<sign_in.keep_signed_in>"` if set. It makes the one Passhand attempt itself and
+     `BU` is `sign_in`'s user; `--dismiss '<text>'` per `BH.dismiss`; `--button '<BH.sign_in_button>'`
+     and `--next-button '<BH.next_button>'` if set; and with `preprod.sign_in`: `--passhand`, plus
+     `--keep-signed-in '<sign_in.keep_signed_in>'` if set. It makes the one Passhand attempt itself and
      keeps section 1c's 20-hour gate in the same `<config name>.signin-failed`.
+   - Exit 2 (the URL isn't one of its hosts) or exit 1 (an error): one report line with its `error`, no
+     notice.
    - `"state": "signed-in"`: nothing to do (a report line when `signed_in_now`). Anything else (exit 3):
      the sign-in notice above, "is signed out", with `--title` ending "as <BU> in the browser host", and
      its `reason` as the Passhand line. Without `preprod.sign_in` the login page stays open in that
