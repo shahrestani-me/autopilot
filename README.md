@@ -260,6 +260,7 @@ State, in `~/.local/state/autopilot/`:
 | `runs/`, `streams/`, `current-jobs/`, `attempts/` | per-run hook state, claimed jobs, attempt counts |
 | `auth-broken`, `github-broken`, `<project>.preprod-broken`, `linear-automations` | problems runs found; `/autopilot:status` explains them |
 | `<project>.keepalive`, `<project>.signin-notice`, `<project>.signin-failed` | the last preprod keep-alive, the open sign-in notice, the last failed Passhand sign-in |
+| `<project>.browser-host.signin-failed` | the browser host's last failed Passhand sign-in (its own 20-hour gate) |
 | `reports/YYYY-MM-DD.md` | the daily report (or each config's `reports.dir`) |
 | `fallback.log`, `fallback-tick.log` | API mode: every run's output and cost; what the tick started |
 | `runstate.log`, `stream.log` | the hooks' own errors (they never fail a run) |

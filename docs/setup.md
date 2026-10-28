@@ -343,7 +343,10 @@ preprod test user between runs.
   it, `sign-in` leaves the login page open in that window and you sign in there once. It clicks away
   `browser_host.dismiss` prompts first: a fresh profile may show an app's install banner, which blocks
   clicks until it's dismissed. The keep-alive (orchestrator section 1b) starts the browser and runs
-  `sign-in` every 20 hours.
+  `sign-in` every 20 hours. Like the runs in Chrome it makes one attempt, then waits 20 hours, but its
+  gate is a file of its own, `<config name>.browser-host.signin-failed`, so a failure for its test user
+  never holds up Chrome's sign-in. Only a clicked sign-in counts: when Passhand refuses or fills nothing
+  (e.g. the same login page is open in Chrome too), the server saw nothing, so it's "not tried".
 - **CDP is a local, unauthenticated full control of that browser.** Anything running as you on this Mac
   can connect to `127.0.0.1:<port>` and drive it, signed in as the test user; a driver can also open
   `file://` pages. So keep it to preprod test accounts, keep the Mac's user account to yourself, and
