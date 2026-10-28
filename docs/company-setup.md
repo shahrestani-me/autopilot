@@ -314,7 +314,7 @@ Autopilot only takes issues from Linear projects that a config lists, and only c
 lists. To start something new with it, repo and all:
 
 1. Create the Linear project, and a config for it with no repos yet and `new_repos` set
-   ([example](../examples/new-project/autopilot.yaml), [what it does](setup.md#7-new-repositories-optional-since-0190)):
+   ([example](../examples/new-project/autopilot.yaml), [what it does](setup.md#7-new-and-existing-repositories-optional-since-0190)):
 
    ```bash
    cp examples/new-project/autopilot.yaml ~/.config/autopilot/projects/<project>.yaml
@@ -324,10 +324,11 @@ lists. To start something new with it, repo and all:
    the project's other issues are Linear-only: answers, specs and planning in Linear.
 2. Write the first issue: what the repo is for and the scaffold you want (language, framework, the
    checks CI should run), with a line `New repo: <name>`. Delegate it. The line counts only when the
-   config's `linear.owner` wrote it.
-3. The run creates the repo with your `gh` login, clones it, adds it to the config's `repos`, and lands
+   config's `linear.owner` wrote it. The repo exists already (made by hand, the app not installed on
+   it)? Write `Add repo: <name>` instead: the run adds it to the config without creating anything.
+3. The run creates the repo with your `gh` login (or, for `Add repo:`, uses the existing one), clones it, adds it to the config's `repos`, and lands
    the scaffold through a PR with CI and review. If the GitHub App is on *Only select repositories*, it
-   first asks you to add the new repo to the installation.
+   first asks you to add the repo to the installation.
 4. Add a ruleset or branch protection to the new repo's default branch, and later its deploy workflows
    and `preprod` in the config. From there, delegate issues as in any project.
 

@@ -1,6 +1,6 @@
 {
   "name": "autopilot",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Autopilot: a Linear agent identity (and GitHub App) that works tickets delegated to it, one per session, implement → PR → CI → AI review → merge → preprod verify, reporting in Linear as Autopilot.",
   "author": {
     "name": "Kamyar Shahrestani"

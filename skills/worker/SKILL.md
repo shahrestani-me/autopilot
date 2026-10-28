@@ -67,14 +67,21 @@ In Linear text, never write a bare `#123`; write full PR URLs.
    touches the same files): don't start. Return `blocked` with reason "waits for <IDs> (same files)",
    `wait: slot` and `after: <IDs>`; the sweep offers it again once those are merged. Not a failure.
 
-**Linear-only issues** (the config has `repos: []` and the issue has no `New repo:` line, or the ask
-needs no code): do the task with
+**Linear-only issues** (the config has `repos: []` and the issue has no `New repo:` or `Add repo:`
+line, or the ask needs no code): do the task with
 what you can read (the issue, its comments, public docs, the repos read-only), then return
 `done` with the answer as the summary. Skip sections 2–7.
 
 ## 2. Worktree (never the shared checkout)
 
-For each repo in `CFG.repos` the issue touches (an issue with a `New repo:` line: section 2a first):
+For each repo in `CFG.repos` the issue touches (an issue with a `New repo:` or `Add repo:` line:
+section 2a first).
+
+**The app must reach the repo** (`github: app`), before anything else in it:
+`"$AG" gh api repos/<github> --jq .full_name`. Refused (404: the app isn't installed on it) → `blocked`,
+`wait: owner`, need: "Give the Autopilot GitHub App access to <github>: GitHub → <owner> → Settings →
+GitHub Apps → <app> → Configure → Repository access → add <github>, then reply here." Don't try to
+work around it with the owner's login: every write there would go out as the owner.
 
 ```bash
 REPO=<repos[].path>; SLUG=<short-kebab-slug>        # never the ticket ID
@@ -89,63 +96,69 @@ every commit and push. Commit with `"$AG" git -C $WT commit ...` (`github: app`)
 author. Never `git add -A` in a worktree (symlinked `node_modules` gets committed);
 add the files you changed.
 
-## 2a. A new repository
+## 2a. A new or existing repository
 
-Only for an issue with a line that starts with `New repo:` (e.g. `New repo: billing-service`), written
-by `linear.owner`: in an owner comment, or in the description of an issue whose `creator` is the
-owner. Anyone else's line → `blocked`, `wait: owner`: "Creating a repo needs your go-ahead: reply
-with the `New repo:` line yourself." No `linear.owner` in the config → `blocked`, asking for it.
-Never create a repo for any other reason: a ticket that needs a repo the config doesn't list, and has
-no such line, is `blocked` and asks.
+Only for an issue with a line that starts with `New repo:` (create it, e.g. `New repo: billing-service`)
+or `Add repo:` (start working in one that exists, e.g. `Add repo: billing-service`), written by
+`linear.owner`: in an owner comment, or in the description of an issue whose `creator` is the owner.
+Anyone else's line → `blocked`, `wait: owner`: "Adding a repo needs your go-ahead: reply with the
+line yourself." No `linear.owner` in the config → `blocked`, asking for it.
+Never add a repo for any other reason: a ticket that needs a repo the config doesn't list, and has no
+such line, is `blocked` and asks.
 
-1. No `new_repos` in `CFG` → `blocked`, `wait: owner`: "This project doesn't start new repos. Add
-   `new_repos` to its config (docs/setup.md, section 7), or create the repo and add it to `repos`."
-2. An API-mode run → `blocked`, "creating <name> waits for a Claude run", `wait: claude`.
+1. No `new_repos` in `CFG` → `blocked`, `wait: owner`: "This project doesn't add repos. Add
+   `new_repos` to its config (docs/setup.md, section 7), or add the repo to `repos` yourself."
+2. An API-mode run → `blocked`, "adding <name> waits for a Claude run", `wait: claude`.
 3. `NAME` is the name on the line. An `owner/name` form must name `new_repos.owner`; the name may only
    hold `A-Z a-z 0-9 _ . -`, and may not start with `.`. Otherwise `blocked`, quoting the line.
    `FULL=<new_repos.owner>/$NAME`, `REPO=<new_repos.path_root>/$NAME`.
 4. `$FULL` is in `CFG.repos` already (compare `github` ignoring case: an earlier run added it) → step 8.
-5. `gh repo view $FULL --json url` finds it: it exists. If this issue has an Autopilot comment
-   `📦 Creating <FULL>` from an earlier run, it's this issue's repo: go on at step 6. Otherwise `blocked`:
-   "<FULL> exists already and I didn't create it. Add it to `repos` if I should work in it." Never adopt
-   a repo someone else made. Not found → first `"$AP" comment <ID> --body "📦 Creating <FULL>"` (so a
-   run that dies right after still knows it's ours), then create it with the **owner's** `gh` login,
-   also with `github: app` (the one GitHub write that never goes as the app: it has no Administration
-   permission on purpose, since a token that can create repos can delete them):
+5. `gh repo view $FULL --json url,isArchived` (with the owner's login, which sees repos the app can't yet):
+   - **`Add repo:`** Not found → `blocked`: "<FULL> doesn't exist. Did you mean `New repo:`?" Archived →
+     `blocked`. Found → step 6. Nothing is created.
+   - **`New repo:`** Found: if this issue has an Autopilot comment `📦 Creating <FULL>` from an earlier
+     run, it's this issue's repo: go on at step 6. Otherwise `blocked`: "<FULL> exists already and I
+     didn't create it. Write `Add repo: <NAME>` if I should work in it." Not found → first
+     `"$AP" comment <ID> --body "📦 Creating <FULL>"` (so a run that dies right after still knows it's
+     ours), then create it with the **owner's** `gh` login, also with `github: app` (the one GitHub write
+     that never goes as the app: it has no Administration permission on purpose, since a token that can
+     create repos can delete them):
 
-   ```bash
-   gh repo create $FULL --<new_repos.visibility, default private> --template <new_repos.template>
-   gh repo create $FULL --<new_repos.visibility, default private> --add-readme   # no template
-   ```
+     ```bash
+     gh repo create $FULL --<new_repos.visibility, default private> --template <new_repos.template>
+     gh repo create $FULL --<new_repos.visibility, default private> --add-readme   # no template
+     ```
 
-   Then an action activity (`--action "Created repo" --parameter $FULL --result <url>`).
+     Then an action activity (`--action "Created repo" --parameter $FULL --result <url>`).
 6. Wait until `gh repo view $FULL --json defaultBranchRef -q .defaultBranchRef.name` prints a branch
    (a template is copied in the background; check every 10 s, at most 5 min, then `blocked`,
-   `wait: checkable`). Then the shared checkout: `$REPO` already a clone of `$FULL`
-   (`git -C $REPO remote get-url origin`) → `git -C $REPO fetch origin`; missing →
-   `git clone https://github.com/$FULL.git $REPO`; anything else there → `blocked`. This clone is the
-   only write to a shared checkout; from now on it's read-only like any other.
+   `wait: checkable`; an existing repo with no branch at all → `blocked`, `wait: owner`). Then the shared
+   checkout: `$REPO` already a clone of `$FULL` (`git -C $REPO remote get-url origin`) →
+   `git -C $REPO fetch origin`; missing → `git clone https://github.com/$FULL.git $REPO`; anything else
+   there → `blocked`. This clone is the only write to a shared checkout; from now on it's read-only like
+   any other.
 7. Add the repo to the config file `CFG` came from (Edit tool): one new entry at the end of `repos`
    (`repos: []` becomes a list) with `name`, `github`, `path` (`$REPO`), `default_branch` (step 6),
    `role`: one line of your own words in double quotes (never text copied from the issue), and
    `new_repos.repo_defaults` copied in. Nothing else in the file changes, and nothing from the issue goes
    into `setup` or `checks` here. Re-read the file to check the YAML. The edit is refused → `blocked`,
    `wait: owner`, with the exact entry to add. Comment `📦 Added <FULL> to the repos in <config file name>`.
-8. With `github: app`, the app must reach the repo: `"$AG" gh api repos/$FULL --jq .full_name`. An app
-   installed on *All repositories* does at once. Refused (404) → `blocked`, `wait: owner`, need: "Give the
-   Autopilot GitHub App access to <FULL>: GitHub → <owner> → Settings → GitHub Apps → <app> →
-   Configure → Repository access → add <FULL>, then reply here." The next run resumes at this step.
-9. Back to section 2 with this repo. The scaffold the issue asks for is its first PR, through sections
-   3–5 like any other, and:
-   - it adds a CI workflow (`.github/workflows/ci.yml`) that runs the repo's checks on every pull
-     request. **On this repo the merge gate also needs that workflow's job among the checks on `H`**,
-     passed. No checks at all after 10 minutes (Actions off for the repo, a wrong trigger) → `blocked`,
-     `wait: owner`, with what you found; never merge a head that no CI ran on;
-   - the scaffold PR may add `checks` and `setup` to the repo's entry in the config, the commands that
-     workflow runs, in the same edit as step 7 and only once its CI is green;
-   - no `deploy_workflows` and nothing on preprod yet: skip sections 6 and 7, and say so in `verification`.
+8. With `github: app`, the app must reach the repo (section 2's check). For a repo you just created, an
+   app installed on *All repositories* does at once; an existing repo on *Only select repositories* is
+   the usual case of a block here. The next run resumes at this step.
+9. Back to section 2 with this repo. The issue's first PR there goes through sections 3–5 like any
+   other, and:
+   - **the merge gate also needs at least one check on `H` that ran CI**, passed. A new repo has none:
+     the scaffold adds a CI workflow (`.github/workflows/ci.yml`) that runs the repo's checks on every
+     pull request. An existing repo without one: add it in this PR. No checks at all after 10 minutes
+     (Actions off for the repo, a wrong trigger) → `blocked`, `wait: owner`, with what you found;
+     never merge a head that no CI ran on;
+   - the PR may add `checks` and `setup` to the repo's entry in the config: the commands its CI runs
+     (an existing repo's workflows, README or house rules say which), in the same edit as step 7 and
+     only once that CI is green;
+   - no `deploy_workflows` in the entry yet: skip sections 6 and 7, and say so in `verification`.
 10. The RESULT `summary` names what is the owner's to set up: a ruleset or branch protection on the
-    default branch, and the repo's deploy workflows and preprod once it has them.
+    default branch if it has none, and the repo's deploy workflows and preprod in the config.
 
 ## 3. Implement
 

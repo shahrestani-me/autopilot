@@ -26,7 +26,7 @@ Contents: [Using it](#using-it) · [Repository](#repository) · [Commands in Cla
 | Autopilot to work an issue | Delegate it to **Autopilot** in Linear (you stay the assignee) |
 | To answer its question | Reply in the issue's Autopilot thread, or mention `@Autopilot` |
 | Changes on its PR | Comment `@claude-autopilot …` on the PR |
-| A new repo for a project | A `New repo: <name>` line in the issue; the config needs `new_repos` ([how](docs/company-setup.md#starting-a-new-project)) |
+| A new repo for a project, or an existing one it doesn't list | A `New repo: <name>` or `Add repo: <name>` line in the issue; the config needs `new_repos` ([how](docs/company-setup.md#starting-a-new-project)) |
 | A non-Claude model to write one ticket's code | A `Coder model: <model>` line in the description, or a `coder:<model>` label |
 | To stop it for a while | `/autopilot:pause`, then `/autopilot:resume` |
 | To use no Claude subscription tokens | `/autopilot:api-mode on` |
