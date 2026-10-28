@@ -26,7 +26,7 @@ Contents: [Using it](#using-it) · [Repository](#repository) · [Commands in Cla
 | Autopilot to work an issue | Delegate it to **Autopilot** in Linear (you stay the assignee) |
 | To answer its question | Reply in the issue's Autopilot thread, or mention `@Autopilot` |
 | Changes on its PR | Comment `@claude-autopilot …` on the PR |
-| A new repo for a project | A `New repo: <name>` line in the issue; the config needs `new_repos` ([how](docs/company-setup.md#starting-a-new-project)) |
+| A new repo for a project, or an existing one it doesn't list | A `New repo: <name>` or `Add repo: <name>` line in the issue; the config needs `new_repos` ([how](docs/company-setup.md#starting-a-new-project)) |
 | A non-Claude model to write one ticket's code | A `Coder model: <model>` line in the description, or a `coder:<model>` label |
 | To stop it for a while | `/autopilot:pause`, then `/autopilot:resume` |
 | To use no Claude subscription tokens | `/autopilot:api-mode on` |
@@ -193,6 +193,7 @@ Up to `AUTOPILOT_MAX_RUNS` (3) runs side by side; a lock or slot untouched for 2
 ```bash
 bin/autopilot-github auth-check                 # the bot and the repos the app is installed on; exit 2 = not set up
 bin/autopilot-github identity                   # name and e-mail commits are authored with
+bin/autopilot-github refresh                    # mint a new installation token (after repos were added to the app)
 bin/autopilot-github gh pr create ...           # gh with an installation token: the PR is the bot's
 bin/autopilot-github git -C WT commit|push ...  # git as the bot; push/fetch authenticate as the app
 ```

@@ -78,8 +78,8 @@ the user-sign-in client secret is dropped (Autopilot never signs users in).
 
 Then **install** it (`https://github.com/apps/<slug>/installations/new`): your org
 → *Only select repositories* → the repos in any config's `repos`. Add a repo there before a config uses it.
-A config with `new_repos` makes repos as it goes; then either add each one when the run asks, or choose
-*All repositories* ([section 7](#7-new-repositories-optional-since-0190)).
+A config with `new_repos` adds repos as it goes; then either add each one when the run asks, or choose
+*All repositories* ([section 7](#7-new-and-existing-repositories-optional-since-0190)).
 
 Then copy the key and webhook secret to the gateway: `bin/autopilot-github-setup worker-secrets`.
 
@@ -397,21 +397,26 @@ Notes for driver authors:
 - If Passhand's extension folder changes while the browser host runs, `status` says
   `"extension_changed": true`: stop and start it, since a running profile keeps the old extension code.
 
-## 7. New repositories (optional, since 0.19.0)
+## 7. New and existing repositories (optional, since 0.19.0)
 
 By default a run only works in the repos a config lists, so a project that doesn't have its repo yet
-can't start with Autopilot. With `new_repos` in the config, an issue that carries a line
-`New repo: <name>`, written by `linear.owner` (in an owner comment, or the description of an issue the
-owner created), starts one (worker section 2a):
+can't start with Autopilot. With `new_repos` in the config, an issue with a line `New repo: <name>`
+starts one, and `Add repo: <name>` (since 0.20.0) starts working in one that exists, e.g. a repo you
+made by hand that the app isn't installed on. The line counts only when `linear.owner` wrote it (an
+owner comment, or the description of an issue the owner created). Worker section 2a:
 
-1. The run creates `<new_repos.owner>/<name>` with **your** `gh` login, also when the GitHub App is set
+1. `New repo:` creates `<new_repos.owner>/<name>` with **your** `gh` login, also when the GitHub App is set
    up. The app has no Administration permission on purpose: a token that can create repos can also
    delete them. Private by default, from `new_repos.template` if you set one, else with a README.
+   `Add repo:` creates nothing: the repo must exist under `new_repos.owner`, and a `New repo:` line for
+   a repo that exists (and that Autopilot didn't create) blocks and asks for `Add repo:` instead.
 2. It clones it to `<new_repos.path_root>/<name>` and adds it to the config's `repos`, with
-   `new_repos.repo_defaults` copied in. From then on it's an ordinary repo of that project.
-3. It lands the issue's scaffold through a PR, CI, review and merge, like any change. That first PR
-   adds a CI workflow that runs the repo's checks, and it only merges once that workflow's job passed on
-   the PR: a head that no CI ran on is never merged.
+   `new_repos.repo_defaults` copied in for a new repo. From then on it's an ordinary repo of that project.
+3. It does the issue's work (a new repo's scaffold) through a PR, CI, review and merge, like any change.
+   That first PR merges only once a CI check passed on it: a new repo's scaffold adds the CI workflow,
+   and so does the first PR in an existing repo without one. A head that no CI ran on is never merged.
+   Before that first merge in an existing repo, any workflow that deploys from its default branch
+   blocks until you list it in `deploy_workflows` (preprod only) or `forbidden.workflows`.
 
 ```yaml
 new_repos:
@@ -426,15 +431,16 @@ new_repos:
 What stays yours:
 
 - **The app's access.** Installed on *All repositories*, the app sees a new repo at once. On *Only select
-  repositories* the run blocks and asks you to add the repo to the installation (GitHub → the org →
-  Settings → GitHub Apps → the app → Configure → Repository access); reply in the issue and the next run
-  carries on.
+  repositories*, and for any repo the app isn't installed on (an `Add repo:` one, or one you put in
+  `repos` yourself), the run blocks before any work there and asks you to add the repo to the
+  installation (GitHub → the org → Settings → GitHub Apps → the app → Configure → Repository access);
+  reply in the issue and the next run carries on.
 - **Rules on the default branch.** A new repo has none; add a ruleset or branch protection. The run's
   summary reminds you.
-- **Preprod.** A new repo has no deploy workflows, so the scaffold isn't verified on preprod. Add its
-  `deploy_workflows` to the config once it deploys.
+- **Preprod.** The entry the run adds has no deploy workflows, so its first change isn't verified on
+  preprod. Add its `deploy_workflows` to the config once it deploys.
 
-Without `new_repos`, an issue with a `New repo:` line blocks and asks; nothing is ever created from any
-other wording, or from a line someone other than the owner wrote. API-mode runs never create a repo:
-they leave it for the next Claude run. Keep `visibility: private` unless every repo the project starts
-may be public from its first commit.
+Without `new_repos`, an issue with a `New repo:` or `Add repo:` line blocks and asks; no repo is ever
+created or added from any other wording, or from a line someone other than the owner wrote. API-mode
+runs never create or add a repo: they leave it for the next Claude run. Keep `visibility: private`
+unless every repo the project starts may be public from its first commit.
