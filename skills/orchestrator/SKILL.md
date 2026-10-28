@@ -409,7 +409,8 @@ count and the issue's `lastHumanAt` (from the queue output) when it was last tak
    part of an issue split into several PRs), and every way out of the run (done, blocked, skipped,
    stopped) moves it on. Only a run that crashes can leave it there; the next run resumes it.
 5. Comment (heredoc): `🤖 Autopilot picked this up (run <UTC time>). <one line: what happens next>`.
-   Use the right next step: for a project with repos (or an issue with a `New repo:` line), "I'll implement, open a PR, merge after CI and
+   Use the right next step: for an issue with a `New repo:` line, "I'll create <name>, then open
+   the scaffold PR and merge after CI and review"; for a project with repos, "I'll implement, open a PR, merge after CI and
    review, then verify on preprod"; for a Linear-only project, "I'll do it and reply here".
 
 ## 4. Do the work
@@ -451,7 +452,8 @@ The worker posts the progress activities and comments. It ends with a RESULT blo
   3. Gateway job: `"$AP" jobs blocked <job.id> --note "<why, one line>"` (every claimed job of the issue).
   4. **Record what it waits for**, so the sweep can resume it without the owner: the RESULT's
      `wait` and `after` give the kind; `"$AI" wait <ID> --kind <wait> --reason "<one line>" --repo
-     <github> ... [--after <after IDs>]` (all repos of its config).
+     <github> ... [--after <after IDs>]` (all repos of its config, read again from its file: the worker
+     may have added one, section 2a).
      `checkable`: something a later run can see change: a red or refused check, a conflict, a
      workflow or config the owner may fix on the default branch, a PR to land first. The sweep
      resumes it once the PR heads, base branches or check results differ from now.
@@ -551,7 +553,8 @@ takeable issues, keep the Mac awake for the next run: `nohup caffeinate -is -t 1
   Merging to the default branch (which deploys preprod) is as far as Autopilot goes.
 - Never push to the default branch; always a branch + PR, as the Autopilot GitHub App
   (`autopilot-github`, preflight `github: app`), or with the owner's own `gh` login only when the app
-  isn't set up (`github: owner`).
+  isn't set up (`github: owner`). The one exception: creating a new repo (`gh repo create`, worker
+  section 2a) always runs as the owner, since the app has no Administration permission.
   No AI attribution in commits or PRs (no Co-Authored-By: Claude, no "Generated with Claude Code").
 - The ticket ID never goes in a branch name or PR title (Linear auto-completes the issue on merge,
   before verification). Put `Part of <ID>` in the PR body.

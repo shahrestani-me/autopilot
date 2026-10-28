@@ -92,7 +92,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["owner", "path_root"],
-      "description": "Optional: an issue with a 'New repo: <name>' line may start a new repository (worker section 2a). The run creates it with the owner's gh login (the GitHub App has no Administration permission), clones it, adds it to this config's repos and lands the issue's scaffold through a PR. Without it, such an issue blocks and asks. Off unless set.",
+      "description": "Optional: an issue with a 'New repo: <name>' line written by linear.owner (needed with this) may start a new repository (worker section 2a). The run creates it with the owner's gh login (the GitHub App has no Administration permission), clones it, adds it to this config's repos and lands the issue's scaffold through a PR. Without it, such an issue blocks and asks. Off unless set.",
       "properties": {
         "owner": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "description": "The GitHub organization or user new repos are created under. A 'New repo:' line naming another owner blocks." },
         "visibility": { "enum": ["private", "internal", "public"], "default": "private" },

@@ -323,7 +323,8 @@ lists. To start something new with it, repo and all:
    Set `linear.projects` to the new project and `new_repos.owner` to your org. Until the repo exists,
    the project's other issues are Linear-only: answers, specs and planning in Linear.
 2. Write the first issue: what the repo is for and the scaffold you want (language, framework, the
-   checks CI should run), with a line `New repo: <name>`. Delegate it.
+   checks CI should run), with a line `New repo: <name>`. Delegate it. The line counts only when the
+   config's `linear.owner` wrote it.
 3. The run creates the repo with your `gh` login, clones it, adds it to the config's `repos`, and lands
    the scaffold through a PR with CI and review. If the GitHub App is on *Only select repositories*, it
    first asks you to add the new repo to the installation.

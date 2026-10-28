@@ -401,7 +401,8 @@ Notes for driver authors:
 
 By default a run only works in the repos a config lists, so a project that doesn't have its repo yet
 can't start with Autopilot. With `new_repos` in the config, an issue that carries a line
-`New repo: <name>` (in its description or an owner comment) starts one (worker section 2a):
+`New repo: <name>`, written by `linear.owner` (in an owner comment, or the description of an issue the
+owner created), starts one (worker section 2a):
 
 1. The run creates `<new_repos.owner>/<name>` with **your** `gh` login, also when the GitHub App is set
    up. The app has no Administration permission on purpose: a token that can create repos can also
@@ -409,7 +410,8 @@ can't start with Autopilot. With `new_repos` in the config, an issue that carrie
 2. It clones it to `<new_repos.path_root>/<name>` and adds it to the config's `repos`, with
    `new_repos.repo_defaults` copied in. From then on it's an ordinary repo of that project.
 3. It lands the issue's scaffold through a PR, CI, review and merge, like any change. That first PR
-   adds a CI workflow that runs the repo's checks, since a PR with no checks never passes the merge gate.
+   adds a CI workflow that runs the repo's checks, and it only merges once that workflow's job passed on
+   the PR: a head that no CI ran on is never merged.
 
 ```yaml
 new_repos:
@@ -418,7 +420,6 @@ new_repos:
   path_root: ~/src                # the checkout goes to ~/src/<name>
   # template: example-org/service-template
   repo_defaults:
-    house_rules: CONTRIBUTING.md
     notes: ["New service: keep the first PR to the scaffold the issue asks for."]
 ```
 
@@ -434,4 +435,6 @@ What stays yours:
   `deploy_workflows` to the config once it deploys.
 
 Without `new_repos`, an issue with a `New repo:` line blocks and asks; nothing is ever created from any
-other wording. API-mode runs never create a repo: they leave it for the next Claude run.
+other wording, or from a line someone other than the owner wrote. API-mode runs never create a repo:
+they leave it for the next Claude run. Keep `visibility: private` unless every repo the project starts
+may be public from its first commit.
