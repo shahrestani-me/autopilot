@@ -257,6 +257,7 @@ before the webhook secret reached the Worker, shows an error; that's expected.)
    | `preprod` | the preprod URL, test users, and how to verify a change in a browser; optionally `sign_in`, so runs sign a test user back in with Passhand ([setup](setup.md#5-preprod-sign-in-with-passhand-optional-since-0170)), and `browser_host`, a Chromium of Autopilot's own for drivers that connect over CDP, such as Playwright MCP ([setup](setup.md#6-browser-host-for-cdp-drivers-optional-since-0180)) |
    | `forbidden` | production hosts, cloud projects, commands and workflows it must never touch |
    | `spend` | the most a ticket may spend on paid models |
+   | `new_repos` | optional: let an issue start a new repo ([below](#starting-a-new-project)) |
 
    Name the file after the config's `name`. Clone each repo to the `path` you gave it.
 
@@ -305,7 +306,30 @@ If nothing happens, see [Getting help](#getting-help).
 
 To add a person: add their Linear id (`bin/autopilot-linear users`) to `ALLOWED_USER_IDS` in
 `gateway/wrangler.toml` and run `W deploy`. To add a repo: install the GitHub App on it, then add it to a
-project config.
+project config. To let Autopilot create one, see [Starting a new project](#starting-a-new-project).
+
+## Starting a new project
+
+Autopilot only takes issues from Linear projects that a config lists, and only changes repos that config
+lists. To start something new with it, repo and all:
+
+1. Create the Linear project, and a config for it with no repos yet and `new_repos` set
+   ([example](../examples/new-project/autopilot.yaml), [what it does](setup.md#7-new-repositories-optional-since-0190)):
+
+   ```bash
+   cp examples/new-project/autopilot.yaml ~/.config/autopilot/projects/<project>.yaml
+   ```
+
+   Set `linear.projects` to the new project and `new_repos.owner` to your org. Until the repo exists,
+   the project's other issues are Linear-only: answers, specs and planning in Linear.
+2. Write the first issue: what the repo is for and the scaffold you want (language, framework, the
+   checks CI should run), with a line `New repo: <name>`. Delegate it. The line counts only when the
+   config's `linear.owner` wrote it.
+3. The run creates the repo with your `gh` login, clones it, adds it to the config's `repos`, and lands
+   the scaffold through a PR with CI and review. If the GitHub App is on *Only select repositories*, it
+   first asks you to add the new repo to the installation.
+4. Add a ruleset or branch protection to the new repo's default branch, and later its deploy workflows
+   and `preprod` in the config. From there, delegate issues as in any project.
 
 ## Getting help
 
@@ -324,7 +348,8 @@ secrets).
 
 - Secrets only in the Mac's Keychain and as Cloudflare Worker secrets; never in files, chat or issues.
 - `gateway/wrangler.toml` and `~/.config/autopilot/` stay out of git.
-- The GitHub App is installed on selected repositories only.
+- The GitHub App is installed on selected repositories only (with `new_repos`, *All repositories* is the
+  alternative to adding each new repo by hand).
 - Every project config lists its production hosts, cloud projects and release commands under `forbidden`.
 - The Mac's user account is the trust boundary: anyone who can use it can act as Autopilot.
 - Passhand logins marked `auto` (for `preprod.sign_in`) are preprod test accounts only, never a personal
