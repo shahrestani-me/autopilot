@@ -57,7 +57,7 @@
     "repos": {
       "type": "array",
       "default": [],
-      "description": "Repositories tickets may change. Empty = Linear-only tasks (answers, triage, docs in Linear).",
+      "description": "Repositories tickets may change. Empty = Linear-only tasks (answers, triage, docs in Linear), unless new_repos lets an issue start one.",
       "items": {
         "type": "object",
         "required": ["name", "github", "path"],
@@ -85,6 +85,29 @@
             }
           },
           "notes": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "new_repos": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "path_root"],
+      "description": "Optional: an issue with a 'New repo: <name>' line may start a new repository (worker section 2a). The run creates it with the owner's gh login (the GitHub App has no Administration permission), clones it, adds it to this config's repos and lands the issue's scaffold through a PR. Without it, such an issue blocks and asks. Off unless set.",
+      "properties": {
+        "owner": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "description": "The GitHub organization or user new repos are created under. A 'New repo:' line naming another owner blocks." },
+        "visibility": { "enum": ["private", "internal", "public"], "default": "private" },
+        "path_root": { "type": "string", "description": "Folder the shared checkout is cloned into, as <path_root>/<name>." },
+        "template": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "description": "A template repository to create new repos from. Without it a repo starts with only a README." },
+        "repo_defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Copied into the new repo's repos entry. The scaffold PR fills in checks when this leaves them out.",
+          "properties": {
+            "house_rules": { "type": "string" },
+            "setup": { "type": "array", "items": { "type": "string" } },
+            "checks": { "type": "array", "items": { "type": "string" } },
+            "notes": { "type": "array", "items": { "type": "string" } }
+          }
         }
       }
     },

@@ -26,6 +26,7 @@ Contents: [Using it](#using-it) · [Repository](#repository) · [Commands in Cla
 | Autopilot to work an issue | Delegate it to **Autopilot** in Linear (you stay the assignee) |
 | To answer its question | Reply in the issue's Autopilot thread, or mention `@Autopilot` |
 | Changes on its PR | Comment `@claude-autopilot …` on the PR |
+| A new repo for a project | A `New repo: <name>` line in the issue; the config needs `new_repos` ([how](docs/company-setup.md#starting-a-new-project)) |
 | A non-Claude model to write one ticket's code | A `Coder model: <model>` line in the description, or a `coder:<model>` label |
 | To stop it for a while | `/autopilot:pause`, then `/autopilot:resume` |
 | To use no Claude subscription tokens | `/autopilot:api-mode on` |
@@ -58,7 +59,7 @@ Merges reach preprod only; prod is released by hand. Setting it up for a company
 | `bin/autopilot-gateway-setup` | owner-run: stores the gateway's secrets in Keychain and as Worker secrets |
 | `gateway/` | Cloudflare Worker + D1: Linear agent-session and GitHub mention webhooks, instant "Queued" ack, job queue ([docs](docs/gateway.md)) |
 | `schema/autopilot.schema.json` | per-project config schema |
-| `examples/` | a generic `web-app` config and the `sandbox` smoke-test config. Real project configs live in `~/.config/autopilot/projects/`, never here |
+| `examples/` | a generic `web-app` config, a `new-project` config that starts its repo, and the `sandbox` smoke-test config. Real project configs live in `~/.config/autopilot/projects/`, never here |
 | `assets/` | the logo (`logo.svg`) |
 | `docs/` | [company setup guide](docs/company-setup.md), [setup](docs/setup.md), [gateway](docs/gateway.md), [architecture + decisions](docs/architecture.md), [lessons learned](docs/lessons-learned.md) |
 

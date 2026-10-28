@@ -1,0 +1,32 @@
+# A project that starts with no repo. Its first issue carries a line "New repo: <name>": the run
+# creates example-org/<name>, clones it to ~/src/<name>, adds it to `repos` below and lands the
+# scaffold through a PR (worker section 2a, docs/setup.md section 7). Until then, issues are Linear-only.
+version: 1
+name: new-project
+description: A new service, started from scratch by Autopilot.
+
+linear:
+  team: ENG
+  projects: ["New Service"]
+  owner: test-user
+
+repos: []
+
+new_repos:
+  owner: example-org
+  visibility: private
+  path_root: ~/src
+  # template: example-org/service-template   # without it a repo starts with only a README
+  repo_defaults:
+    notes:
+      - "New repo: the first PR is the scaffold the issue asks for, with a CI workflow that runs the checks."
+
+merge:
+  policy: merge-all
+  code_review: high
+
+forbidden:
+  commands: ["gh release create", "gh repo delete"]
+
+spend:
+  paid_model_usd_per_ticket: 1

@@ -63,6 +63,26 @@ class ConfigSchemaTests(unittest.TestCase):
                     jsonschema.validate(cfg, schema)
 
 
+    def test_new_repos(self):
+        schema = json.loads((ROOT / "schema" / "autopilot.schema.json").read_text())
+        cfg = yaml.safe_load((ROOT / "examples" / "new-project" / "autopilot.yaml").read_text())
+        self.assertEqual(cfg["repos"], [])  # starts with no repo
+        self.assertEqual(cfg["new_repos"]["visibility"], "private")
+        web = yaml.safe_load((ROOT / "examples" / "web-app" / "autopilot.yaml").read_text())
+        self.assertNotIn("new_repos", web)  # opt-in
+        cfg["new_repos"] = {"owner": "example-org", "path_root": "~/src", "template": "example-org/template"}
+        jsonschema.validate(cfg, schema)
+        for bad in ({"owner": "example-org"}, {"path_root": "~/src"},
+                    {"owner": "example-org/x", "path_root": "~/src"},
+                    {"owner": "example-org", "path_root": "~/src", "visibility": "secret"},
+                    {"owner": "example-org", "path_root": "~/src", "template": "no-owner"},
+                    {"owner": "example-org", "path_root": "~/src", "admin": True},
+                    {"owner": "example-org", "path_root": "~/src", "repo_defaults": {"github": "a/b"}}):
+            with self.subTest(new_repos=bad):
+                cfg["new_repos"] = bad
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(cfg, schema)
+
     def test_preprod_browser_host(self):
         schema = json.loads((ROOT / "schema" / "autopilot.schema.json").read_text())
         cfg = yaml.safe_load((ROOT / "examples" / "web-app" / "autopilot.yaml").read_text())

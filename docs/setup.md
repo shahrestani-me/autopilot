@@ -78,6 +78,8 @@ the user-sign-in client secret is dropped (Autopilot never signs users in).
 
 Then **install** it (`https://github.com/apps/<slug>/installations/new`): your org
 → *Only select repositories* → the repos in any config's `repos`. Add a repo there before a config uses it.
+A config with `new_repos` makes repos as it goes; then either add each one when the run asks, or choose
+*All repositories* ([section 7](#7-new-repositories-optional-since-0190)).
 
 Then copy the key and webhook secret to the gateway: `bin/autopilot-github-setup worker-secrets`.
 
@@ -394,3 +396,42 @@ Notes for driver authors:
   Passhand finds the browser by the page's URL and refuses when two tabs or browsers show the same one.
 - If Passhand's extension folder changes while the browser host runs, `status` says
   `"extension_changed": true`: stop and start it, since a running profile keeps the old extension code.
+
+## 7. New repositories (optional, since 0.19.0)
+
+By default a run only works in the repos a config lists, so a project that doesn't have its repo yet
+can't start with Autopilot. With `new_repos` in the config, an issue that carries a line
+`New repo: <name>` (in its description or an owner comment) starts one (worker section 2a):
+
+1. The run creates `<new_repos.owner>/<name>` with **your** `gh` login, also when the GitHub App is set
+   up. The app has no Administration permission on purpose: a token that can create repos can also
+   delete them. Private by default, from `new_repos.template` if you set one, else with a README.
+2. It clones it to `<new_repos.path_root>/<name>` and adds it to the config's `repos`, with
+   `new_repos.repo_defaults` copied in. From then on it's an ordinary repo of that project.
+3. It lands the issue's scaffold through a PR, CI, review and merge, like any change. That first PR
+   adds a CI workflow that runs the repo's checks, since a PR with no checks never passes the merge gate.
+
+```yaml
+new_repos:
+  owner: example-org              # the org or user repos are created under; a "New repo:" line can't name another
+  visibility: private             # private (default), internal or public
+  path_root: ~/src                # the checkout goes to ~/src/<name>
+  # template: example-org/service-template
+  repo_defaults:
+    house_rules: CONTRIBUTING.md
+    notes: ["New service: keep the first PR to the scaffold the issue asks for."]
+```
+
+What stays yours:
+
+- **The app's access.** Installed on *All repositories*, the app sees a new repo at once. On *Only select
+  repositories* the run blocks and asks you to add the repo to the installation (GitHub → the org →
+  Settings → GitHub Apps → the app → Configure → Repository access); reply in the issue and the next run
+  carries on.
+- **Rules on the default branch.** A new repo has none; add a ruleset or branch protection. The run's
+  summary reminds you.
+- **Preprod.** A new repo has no deploy workflows, so the scaffold isn't verified on preprod. Add its
+  `deploy_workflows` to the config once it deploys.
+
+Without `new_repos`, an issue with a `New repo:` line blocks and asks; nothing is ever created from any
+other wording. API-mode runs never create a repo: they leave it for the next Claude run.
