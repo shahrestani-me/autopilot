@@ -258,7 +258,9 @@ class FakePage:
     def has_text(self, text):
         return text == "Maybe Later" and "Maybe Later" not in self.clicks
 
-    def click_text(self, text):
+    def click_text(self, text, before=None):
+        if before:
+            before()
         self.clicks.append(text)
         if text == "Next":
             self.step = 2
@@ -302,7 +304,8 @@ class SignInTests(Base):
         os.makedirs(self.ab.HOST_DIR)
         self.ab.write_host({"project": "web-app", "port": free_port(), "allow_hosts": ["staging.example.com"],
                             "forbidden_hosts": ["example.com"]})
-        self.failed = pathlib.Path(self.tmp.name, "web-app.signin-failed")
+        self.failed = pathlib.Path(self.tmp.name, "web-app.browser-host.signin-failed")
+        self.chrome_gate = pathlib.Path(self.tmp.name, "web-app.signin-failed")  # orchestrator 1c's, for Chrome
 
     def args(self, **kw):
         base = dict(url="https://staging.example.com/settings", user="test-user", username=None, passhand=True,
@@ -334,14 +337,14 @@ class SignInTests(Base):
         self.assertEqual(page.navigations, 1)  # never reloaded under a sign-in on its way
         self.assertFalse(self.failed.exists())
 
-    def test_a_passhand_error_during_the_fill_counts_as_the_attempt(self):
+    def test_a_passhand_error_during_the_fill_is_not_an_attempt(self):
         class Hanging(FakePasshand):
             def fill(self, page_url, username):
                 raise self_ab.Fail("Passhand tools/call: no answer in 150 s")
         self_ab = self.ab
         out, code = self.ab.sign_in(self.args(), page=FakePage(), passhand=Hanging())
-        self.assertEqual((out["state"], code), ("failed", 3))
-        self.assertTrue(self.failed.exists())
+        self.assertEqual((out["state"], code), ("not-tried", 3))
+        self.assertFalse(self.failed.exists())  # fill_login never submits: nothing reached the server
 
     def test_not_running_comes_before_the_allowlist(self):
         os.remove(self.ab.HOST_FILE)
@@ -382,13 +385,32 @@ class SignInTests(Base):
         self.assertEqual(out["state"], "not-tried")
         self.assertEqual(ph.fills, [])
 
-    def test_an_attempt_that_crashes_still_counts(self):
+    def test_an_attempt_that_crashes_after_the_click_still_counts(self):
+        class Crashing(FakePage):
+            def probe(self, user):
+                if "Sign in" in self.clicks:
+                    raise OSError("CDP went away")
+                return super().probe(user)
+        with self.assertRaises(OSError):
+            self.ab.sign_in(self.args(), page=Crashing(), passhand=FakePasshand())
+        self.assertTrue(self.failed.exists())
+
+    def test_a_crash_before_the_click_is_not_an_attempt(self):
         class Crashing(FakePage):
             def tick(self, label):
                 raise OSError("CDP went away")
         with self.assertRaises(OSError):
             self.ab.sign_in(self.args(keep_signed_in="Keep me"), page=Crashing(), passhand=FakePasshand())
+        self.assertFalse(self.failed.exists())
+
+    def test_chromes_gate_is_never_read_or_touched(self):
+        self.chrome_gate.write_text("x")
+        out, _ = self.ab.sign_in(self.args(), page=FakePage(), passhand=FakePasshand())
+        self.assertEqual(out["state"], "signed-in")  # Chrome's recent failure doesn't hold this one up
+        self.assertTrue(self.chrome_gate.exists())   # nor does this success clear Chrome's
+        self.ab.sign_in(self.args(), page=FakePage(sign_in_works=False), passhand=FakePasshand())
         self.assertTrue(self.failed.exists())
+        self.assertEqual(self.chrome_gate.read_text(), "x")
 
     def test_no_saved_login_for_the_username_is_not_tried(self):
         out, _ = self.ab.sign_in(self.args(username="someone-else"), page=FakePage(), passhand=FakePasshand())
@@ -408,10 +430,13 @@ class SignInTests(Base):
         self.assertEqual(out["state"], "signed-in")
         self.assertFalse(self.failed.exists())
 
-    def test_passhand_refusing_to_fill_is_a_failure_with_its_message(self):
-        ph = FakePasshand(fill_text="Nothing was filled: two tabs show this page.")
-        out, _ = self.ab.sign_in(self.args(), page=FakePage(), passhand=ph)
-        self.assertEqual(out, {"state": "failed", "reason": "Nothing was filled: two tabs show this page."})
+    def test_passhand_refusing_to_fill_is_not_an_attempt(self):
+        ph = FakePasshand(fill_text="Nothing was filled: the page is open in 2 browsers.")
+        page = FakePage()
+        out, code = self.ab.sign_in(self.args(), page=page, passhand=ph)
+        self.assertEqual((out, code), ({"state": "not-tried", "reason": "Nothing was filled: the page is open in 2 browsers."}, 3))
+        self.assertNotIn("Sign in", page.clicks)
+        self.assertFalse(self.failed.exists())  # the next keep-alive may try again
 
     def test_neither_form_nor_user_is_unknown_and_never_signs_out(self):
         page = FakePage(form=False)

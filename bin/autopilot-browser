@@ -21,8 +21,11 @@ the browser running. One browser host per Mac: start refuses while one runs for 
 
 Signing in never sees a password: Passhand's own MCP server (`passhand mcp`, from its native-host
 manifest) fills the login saved for the page's real origin, then this clicks the sign-in button.
-One attempt; a failure writes $STATE/<project>.signin-failed and no attempt follows for 20 hours,
-the same gate as orchestrator section 1c. It never signs anyone out.
+One attempt: once the sign-in button is clicked, a failure writes
+$STATE/<project>.browser-host.signin-failed and no attempt follows for 20 hours, like orchestrator
+section 1c's gate but in a file of its own, so a failure here never holds up the sign-in in Chrome.
+Anything that ends before the click (Passhand refusing, filling nothing, no button) sent nothing to
+the server, so it is "not tried" and writes no file. It never signs anyone out.
 
 Output is JSON. Exit codes: 0 ok, 1 error, 2 bad arguments or setup, 3 needs the owner (not running,
 signed out, sign-in failed or not tried).
@@ -415,11 +418,14 @@ return {
             self.cdp.send("Input.dispatchMouseEvent", {"type": kind, "x": point["x"], "y": point["y"],
                                                        "button": "left", "clickCount": 1})
 
-    def click_text(self, text):
-        """Click the element showing exactly `text` (the clickable one, if several do). False: none."""
+    def click_text(self, text, before=None):
+        """Click the element showing exactly `text` (the clickable one, if several do). False: none.
+        `before` runs once the element is found, right before the click."""
         point = self.evaluate(_js("const e = findText(a0); return e ? centre(e) : null;", text))
         if not point:
             return False
+        if before:
+            before()
         self._click_at(point)
         return True
 
@@ -597,7 +603,8 @@ def find_chromium():
 
 
 def signin_failed_file(project):
-    return os.path.join(STATE_DIR, f"{project}.signin-failed")
+    """The browser host's own gate: its test user may not be Chrome's (orchestrator 1c's <project>.signin-failed)."""
+    return os.path.join(STATE_DIR, f"{project}.browser-host.signin-failed")
 
 
 # ---------------------------------------------------------------- commands
@@ -780,6 +787,12 @@ def sign_in(args, page=None, passhand=None, now=None):
             page.close()
 
 
+def _stamp(path):
+    """The attempt counts from here, whatever ends it (even a crash): only success removes the file."""
+    with open(path, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+
+
 def _remove(path):
     try:
         os.remove(path)
@@ -812,14 +825,10 @@ def _passhand_sign_in(args, page, project, passhand, seen, now):
         if rows[0][2] != "auto":  # a Passhand that serves several browsers always says the mode
             return {"state": "not-tried", "reason": "the login isn't auto, so Passhand would wait for Touch ID"}
 
-        def fail(reason):
-            return {"state": "failed", "reason": reason}
+        def not_tried(reason):  # before the click: fill_login never submits, so the server saw nothing
+            return {"state": "not-tried", "reason": reason}
 
-        # The attempt counts from here, whatever ends it (even a crash): only success removes the file.
-        with open(failed, "w") as f:
-            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
-
-        def fill(url):  # a fill that times out may have filled: it counts as the attempt
+        def fill(url):
             try:
                 return passhand.fill(url, name)
             except Fail as e:
@@ -827,29 +836,30 @@ def _passhand_sign_in(args, page, project, passhand, seen, now):
 
         text, is_error = fill(href)
         if is_error or not text.startswith("Filled"):
-            return fail(text or "Passhand filled nothing")
+            return not_tried(text or "Passhand filled nothing")
         if text.startswith("Filled only the username"):  # two-step login: Next, then the password page
             if not page.click_text(args.next_button):
-                return fail(f"a username-only form without a '{args.next_button}' button")
+                return not_tried(f"a username-only form without a '{args.next_button}' button")
             deadline = time.time() + args.timeout
             while time.time() < deadline and not (page.probe(args.user) or {}).get("password"):
                 time.sleep(0.5)
             href = page.href()
             if host_of(href) != host_of(args.url):
-                return fail(f"the password page is on {host_of(href)}, not {host_of(args.url)}")
+                return not_tried(f"the password page is on {host_of(href)}, not {host_of(args.url)}")
             text, is_error = fill(href)
             if is_error or not text.startswith("Filled the"):
-                return fail(text or "Passhand filled no password")
+                return not_tried(text or "Passhand filled no password")
         if args.keep_signed_in and page.tick(args.keep_signed_in) == "missing":
-            return fail(f"no '{args.keep_signed_in}' checkbox")
-        if not page.click_text(args.button):
-            return fail(f"no '{args.button}' button")
+            return not_tried(f"no '{args.keep_signed_in}' checkbox")
+        if not page.click_text(args.button, before=lambda: _stamp(failed)):
+            return not_tried(f"no '{args.button}' button")
+
         state, _ = wait_for(page, args.user, args.dismiss, args.timeout, after_click=True)
         if state != "signed-in":
             page.navigate(args.url)
             state, _ = wait_for(page, args.user, args.dismiss, args.timeout)
         if state != "signed-in":
-            return fail(page.message() or f"{args.user} didn't show after signing in")
+            return {"state": "failed", "reason": page.message() or f"{args.user} didn't show after signing in"}
         _remove(failed)
         return {"state": "signed-in", "user": args.user, "signed_in_now": True}
     finally:
@@ -880,7 +890,7 @@ def main(argv=None):
     g.add_argument("--button", default="Sign in", help="the sign-in button's text")
     g.add_argument("--next-button", default="Next", help="a two-step login's Next button")
     g.add_argument("--keep-signed-in", help="label of a 'keep me signed in' checkbox to tick")
-    g.add_argument("--project", help="for <project>.signin-failed (default: the one it was started for)")
+    g.add_argument("--project", help="for <project>.browser-host.signin-failed (default: the one it was started for)")
     g.add_argument("--timeout", type=int, default=20, help="seconds to wait for each page")
     args = p.parse_args(argv)
     try:

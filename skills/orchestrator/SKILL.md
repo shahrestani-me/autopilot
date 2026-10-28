@@ -199,8 +199,10 @@ every 10-minute run would retry it.
      else `keepalive.user`; `--username <BH.username>` if set, else `--username <sign_in.username>` when
      `BU` is `sign_in`'s user; `--dismiss '<text>'` per `BH.dismiss`; `--button '<BH.sign_in_button>'`
      and `--next-button '<BH.next_button>'` if set; and with `preprod.sign_in`: `--passhand`, plus
-     `--keep-signed-in '<sign_in.keep_signed_in>'` if set. It makes the one Passhand attempt itself and
-     keeps section 1c's 20-hour gate in the same `<config name>.signin-failed`.
+     `--keep-signed-in '<sign_in.keep_signed_in>'` if set. It makes the one Passhand attempt itself, with
+     a 20-hour gate like section 1c's but in its own `<config name>.browser-host.signin-failed`: it never
+     reads, writes or clears Chrome's `<config name>.signin-failed`, so don't either for it. Only a clicked
+     sign-in counts; a Passhand refusal or anything else before the click is "not-tried" and writes no file.
    - Exit 2 (the URL isn't one of its hosts) or exit 1 (an error): one report line with its `error`, no
      notice.
    - `"state": "signed-in"`: nothing to do (a report line when `signed_in_now`). Anything else (exit 3):
