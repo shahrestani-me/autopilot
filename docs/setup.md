@@ -411,10 +411,12 @@ owner comment, or the description of an issue the owner created). Worker section
    `Add repo:` creates nothing: the repo must exist under `new_repos.owner`, and a `New repo:` line for
    a repo that exists (and that Autopilot didn't create) blocks and asks for `Add repo:` instead.
 2. It clones it to `<new_repos.path_root>/<name>` and adds it to the config's `repos`, with
-   `new_repos.repo_defaults` copied in. From then on it's an ordinary repo of that project.
+   `new_repos.repo_defaults` copied in for a new repo. From then on it's an ordinary repo of that project.
 3. It does the issue's work (a new repo's scaffold) through a PR, CI, review and merge, like any change.
    That first PR merges only once a CI check passed on it: a new repo's scaffold adds the CI workflow,
    and so does the first PR in an existing repo without one. A head that no CI ran on is never merged.
+   Before that first merge in an existing repo, any workflow that deploys from its default branch
+   blocks until you list it in `deploy_workflows` (preprod only) or `forbidden.workflows`.
 
 ```yaml
 new_repos:
@@ -430,15 +432,15 @@ What stays yours:
 
 - **The app's access.** Installed on *All repositories*, the app sees a new repo at once. On *Only select
   repositories*, and for any repo the app isn't installed on (an `Add repo:` one, or one you put in
-  `repos` yourself), the run blocks before any work there and asks you to add the repo to the installation (GitHub → the org →
-  Settings → GitHub Apps → the app → Configure → Repository access); reply in the issue and the next run
-  carries on.
+  `repos` yourself), the run blocks before any work there and asks you to add the repo to the
+  installation (GitHub → the org → Settings → GitHub Apps → the app → Configure → Repository access);
+  reply in the issue and the next run carries on.
 - **Rules on the default branch.** A new repo has none; add a ruleset or branch protection. The run's
   summary reminds you.
 - **Preprod.** The entry the run adds has no deploy workflows, so its first change isn't verified on
   preprod. Add its `deploy_workflows` to the config once it deploys.
 
 Without `new_repos`, an issue with a `New repo:` or `Add repo:` line blocks and asks; no repo is ever
-created or added from any other wording, or from a line someone other than the owner wrote. API-mode runs never create or add a repo:
-they leave it for the next Claude run. Keep `visibility: private` unless every repo the project starts
-may be public from its first commit.
+created or added from any other wording, or from a line someone other than the owner wrote. API-mode
+runs never create or add a repo: they leave it for the next Claude run. Keep `visibility: private`
+unless every repo the project starts may be public from its first commit.

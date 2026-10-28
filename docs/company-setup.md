@@ -326,8 +326,9 @@ lists. To start something new with it, repo and all:
    checks CI should run), with a line `New repo: <name>`. Delegate it. The line counts only when the
    config's `linear.owner` wrote it. The repo exists already (made by hand, the app not installed on
    it)? Write `Add repo: <name>` instead: the run adds it to the config without creating anything.
-3. The run creates the repo with your `gh` login (or, for `Add repo:`, uses the existing one), clones it, adds it to the config's `repos`, and lands
-   the scaffold through a PR with CI and review. If the GitHub App is on *Only select repositories*, it
+3. The run creates the repo with your `gh` login (or, for `Add repo:`, uses the existing one), clones
+   it, adds it to the config's `repos`, and lands the scaffold (or the issue's work) through a PR with
+   CI and review. If the GitHub App is on *Only select repositories*, it
    first asks you to add the repo to the installation.
 4. Add a ruleset or branch protection to the new repo's default branch, and later its deploy workflows
    and `preprod` in the config. From there, delegate issues as in any project.

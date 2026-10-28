@@ -193,6 +193,7 @@ Up to `AUTOPILOT_MAX_RUNS` (3) runs side by side; a lock or slot untouched for 2
 ```bash
 bin/autopilot-github auth-check                 # the bot and the repos the app is installed on; exit 2 = not set up
 bin/autopilot-github identity                   # name and e-mail commits are authored with
+bin/autopilot-github refresh                    # mint a new installation token (after repos were added to the app)
 bin/autopilot-github gh pr create ...           # gh with an installation token: the PR is the bot's
 bin/autopilot-github git -C WT commit|push ...  # git as the bot; push/fetch authenticate as the app
 ```

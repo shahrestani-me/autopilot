@@ -141,6 +141,13 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(app.token(), "ghs_cached")
         self.assertEqual(http.calls, [])
 
+    def test_refresh_mints_a_new_token_over_a_cached_one(self):
+        kc = keychain(**{"installation-token": "ghs_cached"})
+        kc.comments["installation-token"] = f"exp={NOW + 3000}"
+        app = apg.GitHubApp(kc, FakeHTTP(), now=lambda: NOW)
+        self.assertEqual(apg.run(["refresh"], app=app), {"ok": True, "tokenSource": "minted"})
+        self.assertEqual(kc.items["installation-token"], "ghs_minted123")
+
     def test_never_uses_a_cached_personal_token_or_one_about_to_expire(self):
         for token, exp in (("ghp_personal", NOW + 3000), ("github_pat_x", NOW + 3000), ("ghs_old", NOW + 300), ("ghs_nocomment", None)):
             kc = keychain(**{"installation-token": token})

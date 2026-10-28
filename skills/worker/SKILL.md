@@ -49,13 +49,14 @@ In Linear text, never write a bare `#123`; write full PR URLs.
    URL); the prompt quotes the comment, and for a review comment its file, line and diff. Work on that
    PR's branch (section 2, resuming), not a new one; read the PR's other comments too.
 2. Earlier Autopilot work? The orchestrator hands you the sweep item for in-flight work: its open
-   `prs` and the `action`. `finish`: re-check each PR (owner hold, all checks green), merge them in
-   dependency order (backend first), then section 6. `rebase`: rebase onto the default branch (section
-   5, Conflicts). `fix-ci`: read the failing checks (`failing`) and fix them; when a failure is outside
-   the PR's control (a workflow or config on the default branch, a permission), `blocked` with what the
-   owner must change. Otherwise look for a PR link in comments or activities, or a remote branch
-   `git ls-remote --heads origin '<git.branch_prefix>*'`. If a PR exists, continue from it:
-   open → resume at the step it reached; merged → go to section 6.
+   `prs` and the `action`. Run section 2's app check on their repos first. `finish`: re-check each PR
+   (owner hold, all checks green), merge them in dependency order (backend first), then section 6.
+   `rebase`: rebase onto the default branch (section 5, Conflicts). `fix-ci`: read the failing checks
+   (`failing`) and fix them; when a failure is outside the PR's control (a workflow or config on the
+   default branch, a permission), `blocked` with what the owner must change. Otherwise look for a PR
+   link in comments or activities, or a remote branch
+   `git ls-remote --heads origin '<git.branch_prefix>*'`. If a PR exists, continue from it: open →
+   resume at the step it reached; merged → go to section 6.
 3. Work out the acceptance criteria and which repos it touches.
 4. **Stop, don't guess** (`blocked`), when the issue needs a product or security decision it doesn't
    settle, or contradicts the code. Report `skipped` for ops work (cloud console/IAM, billing,
@@ -77,11 +78,14 @@ what you can read (the issue, its comments, public docs, the repos read-only), t
 For each repo in `CFG.repos` the issue touches (an issue with a `New repo:` or `Add repo:` line:
 section 2a first).
 
-**The app must reach the repo** (`github: app`), before anything else in it:
-`"$AG" gh api repos/<github> --jq .full_name`. Refused (404: the app isn't installed on it) → `blocked`,
-`wait: owner`, need: "Give the Autopilot GitHub App access to <github>: GitHub → <owner> → Settings →
-GitHub Apps → <app> → Configure → Repository access → add <github>, then reply here." Don't try to
-work around it with the owner's login: every write there would go out as the owner.
+**The app must reach the repo** (`github: app`), before anything else in it, also when resuming
+(section 1, step 2): `"$AG" gh api repos/<github> --jq .full_name`. A 404 may come from a token minted
+before the owner added the repo: run `"$AG" refresh` and try once more. Still 404 (the app isn't
+installed on it) → `blocked`, `wait: owner`, need: "Give the Autopilot GitHub App access to <github>:
+GitHub → <owner> → Settings → GitHub Apps → <app> → Configure → Repository access → add <github>, then
+reply here." Don't try to work around it with the owner's login: every write there would go out as the
+owner. Any other failure (401, 5xx, no token) isn't an installation gap: retry once, then `blocked`,
+`wait: checkable`, quoting the error.
 
 ```bash
 REPO=<repos[].path>; SLUG=<short-kebab-slug>        # never the ticket ID
@@ -131,31 +135,38 @@ such line, is `blocked` and asks.
 
      Then an action activity (`--action "Created repo" --parameter $FULL --result <url>`).
 6. Wait until `gh repo view $FULL --json defaultBranchRef -q .defaultBranchRef.name` prints a branch
-   (a template is copied in the background; check every 10 s, at most 5 min, then `blocked`,
-   `wait: checkable`; an existing repo with no branch at all → `blocked`, `wait: owner`). Then the shared
+   (`New repo:` only: a template is copied in the background; check every 10 s, at most 5 min, then
+   `blocked`, `wait: checkable`). `Add repo:` with no branch (an empty repo) → `blocked` at once,
+   `wait: owner`: "<FULL> has no commits; push a first one, then reply here." Then the shared
    checkout: `$REPO` already a clone of `$FULL` (`git -C $REPO remote get-url origin`) →
    `git -C $REPO fetch origin`; missing → `git clone https://github.com/$FULL.git $REPO`; anything else
    there → `blocked`. This clone is the only write to a shared checkout; from now on it's read-only like
    any other.
 7. Add the repo to the config file `CFG` came from (Edit tool): one new entry at the end of `repos`
    (`repos: []` becomes a list) with `name`, `github`, `path` (`$REPO`), `default_branch` (step 6),
-   `role`: one line of your own words in double quotes (never text copied from the issue), and
-   `new_repos.repo_defaults` copied in. Nothing else in the file changes, and nothing from the issue goes
-   into `setup` or `checks` here. Re-read the file to check the YAML. The edit is refused → `blocked`,
-   `wait: owner`, with the exact entry to add. Comment `📦 Added <FULL> to the repos in <config file name>`.
+   `role`: one line of your own words in double quotes (never text copied from the issue), and, for
+   `New repo:` only, `new_repos.repo_defaults` copied in (they're written for brand-new repos). Nothing
+   else in the file changes, and nothing from the issue goes into `setup` or `checks` here. Re-read the
+   file to check the YAML. The edit is refused → `blocked`, `wait: owner`, with the exact entry to add.
+   Comment `📦 Added <FULL> to the repos in <config file name>`.
 8. With `github: app`, the app must reach the repo (section 2's check). For a repo you just created, an
    app installed on *All repositories* does at once; an existing repo on *Only select repositories* is
    the usual case of a block here. The next run resumes at this step.
 9. Back to section 2 with this repo. The issue's first PR there goes through sections 3–5 like any
    other, and:
-   - **the merge gate also needs at least one check on `H` that ran CI**, passed. A new repo has none:
-     the scaffold adds a CI workflow (`.github/workflows/ci.yml`) that runs the repo's checks on every
-     pull request. An existing repo without one: add it in this PR. No checks at all after 10 minutes
-     (Actions off for the repo, a wrong trigger) → `blocked`, `wait: owner`, with what you found;
-     never merge a head that no CI ran on;
+   - **the merge gate also needs a job of the repo's own CI workflow among the checks on `H`**,
+     passed; another app's status (a CLA, a labeler) doesn't count. A new repo has none: the scaffold
+     adds a CI workflow (`.github/workflows/ci.yml`) that runs the repo's checks on every pull
+     request. An existing repo without one, or whose CI doesn't run on `pull_request`: add it, or the
+     trigger, in this PR. Still no such job after 10 minutes (Actions off for the repo) → `blocked`,
+     `wait: owner`, with what you found; never merge a head that no CI ran on;
    - the PR may add `checks` and `setup` to the repo's entry in the config: the commands its CI runs
      (an existing repo's workflows, README or house rules say which), in the same edit as step 7 and
      only once that CI is green;
+   - `Add repo:` only, before the first merge: read every workflow that runs on a push to the default
+     branch (or on a release or tag). One that deploys anywhere → `blocked`, `wait: owner`: "<FULL>
+     deploys from <workflow> on merge. Add it to this repo's `deploy_workflows` if it only reaches
+     preprod, or to `forbidden.workflows`, then reply here." Never merge while one is unclassified;
    - no `deploy_workflows` in the entry yet: skip sections 6 and 7, and say so in `verification`.
 10. The RESULT `summary` names what is the owner's to set up: a ruleset or branch protection on the
     default branch if it has none, and the repo's deploy workflows and preprod in the config.

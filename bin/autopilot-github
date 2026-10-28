@@ -19,6 +19,7 @@ file: `gh` and `git` get the token in their environment only.
 
   autopilot-github auth-check        {"ok": true, "bot": ..., "repos": [...]}; exit 2 when not set up
   autopilot-github identity          {"name": ..., "email": ...} for commits
+  autopilot-github refresh           mint a new installation token now, replacing the cached one
   autopilot-github gh <args...>      gh with GH_TOKEN = an installation token
   autopilot-github git <args...>     git committing as the bot; push/fetch authenticate as the app
 
@@ -314,6 +315,9 @@ def run(argv, app=None, execvpe=os.execvpe, environ=None):
         return app.auth_check()
     if cmd == "identity":
         return app.identity()
+    if cmd == "refresh":  # a cached token may predate repos added to the installation
+        app._token = app._mint()
+        return {"ok": True, "tokenSource": app.token_source}
     if cmd == "gh":
         return execvpe("gh", *gh_command(rest, app.token(), environ))  # never returns
     if cmd == "git":
