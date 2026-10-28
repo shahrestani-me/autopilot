@@ -254,7 +254,7 @@ before the webhook secret reached the Worker, shows an error; that's expected.)
    | `linear` | the team key, the Linear projects Autopilot takes issues from, your workflow state names, the owner who answers questions |
    | `repos` | each repo's GitHub name, local clone path, setup and check commands, house rules and notes |
    | `merge` | merge policy, review depth, review model |
-   | `preprod` | the preprod URL, test users, and how to verify a change in a browser; optionally `sign_in`, so runs sign a test user back in with Passhand ([setup](setup.md#5-preprod-sign-in-with-passhand-optional-since-0170)) |
+   | `preprod` | the preprod URL, test users, and how to verify a change in a browser; optionally `sign_in`, so runs sign a test user back in with Passhand ([setup](setup.md#5-preprod-sign-in-with-passhand-optional-since-0170)), and `browser_host`, a Chromium of Autopilot's own for drivers that connect over CDP, such as Playwright MCP ([setup](setup.md#6-browser-host-for-cdp-drivers-optional-since-0180)) |
    | `forbidden` | production hosts, cloud projects, commands and workflows it must never touch |
    | `spend` | the most a ticket may spend on paid models |
 
@@ -329,3 +329,6 @@ secrets).
 - The Mac's user account is the trust boundary: anyone who can use it can act as Autopilot.
 - Passhand logins marked `auto` (for `preprod.sign_in`) are preprod test accounts only, never a personal
   or production account.
+- With `preprod.browser_host`, the browser host's CDP port (`127.0.0.1:9333` by default) gives anything
+  running as you on the Mac full control of that browser, signed in as its test user. Give it a preprod
+  test user of its own, and stop it (`bin/autopilot-browser stop`) when it isn't needed.
