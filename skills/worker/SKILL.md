@@ -366,10 +366,16 @@ counts as approving when, after you confirm its findings against the code, no re
 without). The code review reads the diff; this review runs the app. It runs on the head `H` once its
 checks passed, before the merge, and any push voids it, like a review round.
 
-1. It needs the tool `mcp__Claude_Code_iOS_Simulator__control` (if it's deferred, load it with
-   ToolSearch `select:mcp__Claude_Code_iOS_Simulator__control`). Not in this session, or an API-mode
-   run → `blocked`, "simulator review of <H short> waits for a Claude run", `wait: claude`. Never
-   merge without it.
+1. Two ways to drive the app; both count as the review.
+   - **Unattended** (a scheduled run, the usual case): `xcrun simctl` launches the app and takes
+     screenshots, and the repo's UI tests do the taps (step 5). Claude Code's simulator tool refuses
+     scheduled sessions ("require an attended session"), so don't wait for it or block on it.
+   - **Attended** (the owner runs `/autopilot:run` in an interactive session): the tool
+     `mcp__Claude_Code_iOS_Simulator__control` (if it's deferred, load it with ToolSearch
+     `select:mcp__Claude_Code_iOS_Simulator__control`) taps, types and swipes directly. When it
+     answers that it needs an attended session, carry on unattended.
+   An API-mode run → `blocked`, "simulator review of <H short> waits for a Claude run",
+   `wait: claude`. Never merge without the review.
 2. Build `H`: `cd $WT && <simulator_review.build>`. A failed build is a failed check (section 4):
    fix, push, start again.
 3. Take turns on the simulators: `"$AI" lock simulator --wait 1800` (keep its token; touch your own
@@ -379,20 +385,34 @@ checks passed, before the merge, and any push voids it, like a review round.
 4. Device: `devices[0]`; the others too when the change is about layout or screen size.
    `xcrun simctl boot "<device>"` (already booted is fine), then a fresh install:
    `xcrun simctl uninstall "<device>" <bundle_id>` (`simulator_review.bundle_id`, else
-   `/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' $WT/<app>/Info.plist`). Without
-   `launch_args`, the tool's `launch` with `app_path: $WT/<app>` and `device` installs and starts it;
-   with them, `xcrun simctl install "<device>" $WT/<app>`, then
-   `xcrun simctl launch "<device>" <bundle_id> <launch_args>`. The tool refuses the device (access
-   not granted yet) → `blocked`, `wait: owner`, need: "grant the simulator <device> to Claude Code
-   once, docs/setup.md section 8".
+   `/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' $WT/<app>/Info.plist`), then
+   `xcrun simctl install "<device>" $WT/<app>` and
+   `xcrun simctl launch --terminate-running-process "<device>" <bundle_id> <launch_args>`. Attended,
+   the tool refusing the device (access not granted yet) → carry on unattended, and say so in the
+   PR comment.
 5. `"$AP" activity <ID> --type thought --body "Simulator review of <H short> on <device>: <what>"`.
-   Drive the app like a user with the tool (`screenshot`, `tap`, `swipe`, `text`, `button`), and
-   follow **every** `simulator_review.recipes` line. Exercise each acceptance criterion the simulator
-   can show, and look at a screenshot after every step: what the screen shows is the result, not what
-   the code should do. Save a screenshot for each criterion (`mkdir -p
-   <reports.dir>/<ID>/simulator` first): `xcrun simctl io "<device>" screenshot
-   <reports.dir>/<ID>/simulator/<H short>-<n>.png`. Use the app's own test data; never sign in to an
-   Apple ID or any real account in the simulator.
+   Exercise each acceptance criterion the simulator can show, and follow **every**
+   `simulator_review.recipes` line. Screenshots go to `<reports.dir>/<ID>/simulator/` (`mkdir -p`
+   it first), named `<H short>-<device>-<n>.png`.
+   - What a launch shows (a screen, a layout, a language, the app's state after launch arguments):
+     relaunch with the arguments it needs, then `xcrun simctl io "<device>" screenshot <path>`.
+   - What needs taps, typing or gestures: unattended, a UI test (XCUITest) walks it. Use one the repo
+     has, or add one to the PR (it stays as a regression test; a new test goes through the review
+     round like any code). It calls `XCUIScreen.main.screenshot()` at each step that shows a
+     criterion and adds it as an `XCTAttachment` with `lifetime = .keepAlways`. Run it on the device
+     with `-only-testing:<target>/<class>/<test>` and
+     `-resultBundlePath $WT/build/autopilot-review-<n>.xcresult`, then
+     `xcrun xcresulttool export attachments --path <xcresult> --output-path <dir>`. Attended, drive
+     it with the tool instead (`tap`, `swipe`, `text`, `button`, `screenshot`).
+   - **Look at every screenshot** (Read the PNG): what the screen shows is the result, not what the
+     code or a passing assertion says. A green UI test without a screenshot that shows the criterion
+     doesn't pass a visual criterion.
+   - A system sheet over the app (paste, photos, notifications access): attended, tap it; in a UI
+     test, tap its button through `XCUIApplication(bundleIdentifier: "com.apple.springboard")`. A paste
+     prompt on every launch means the Mac's clipboard is synced into the simulator (docs/setup.md,
+     section 8): quit Simulator.app (`osascript -e 'quit app "Simulator"'`; the devices keep running)
+     and say so in the report.
+   Use the app's own test data; never sign in to an Apple ID or any real account in the simulator.
 6. What a simulator can't show (camera, a document scanner, push, iCloud between devices, a real
    device's speed) is an owner-only check, as in section 7. The review passes only when at least one
    acceptance criterion was exercised in the simulator and passed; the rest goes on the release
@@ -400,9 +420,10 @@ checks passed, before the merge, and any push voids it, like a review round.
    <H short>" in place of "verified on preprod as <user>"). `blocked` with the exact device check
    when nothing could be shown in the simulator, or when such a device check is left and the config
    has no `linear.release_checks_project`. A change the simulator showed in full needs neither.
-7. `xcrun simctl shutdown` each device you booted, then unlock. Record it on the PR: `📱 Simulator review at
-   <H short> on <device> (iOS <version>): PASSED | FAILED`, then one line per criterion (steps →
-   what the screen showed) and the screenshot paths. FAILED is a blocking finding: fix it and push;
+7. `xcrun simctl shutdown` each device you booted, then unlock. Record it on the PR: `📱 Simulator
+   review at <H short> on <devices> (iOS <version>, unattended | attended): PASSED | FAILED`, then one
+   line per criterion (how it was driven: launch arguments or the UI test's name, then what the
+   screen showed) and the screenshot paths. FAILED is a blocking finding: fix it and push;
    the new `H` needs its checks, a review round and a new simulator review. It counts against
    `merge.max_review_loops`.
 

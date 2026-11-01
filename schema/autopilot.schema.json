@@ -88,12 +88,12 @@
             "type": "object",
             "required": ["build", "app", "devices"],
             "additionalProperties": false,
-            "description": "Optional, for an iOS app: before every merge the worker builds the PR head, installs it fresh in an iOS simulator and drives the acceptance criteria there (worker section 5, 'Simulator review'). A passed simulator review of the head is part of the merge gate. Needs Claude Code's iOS Simulator tool (the desktop app), so API-mode runs leave it for a Claude run. Off unless set.",
+            "description": "Optional, for an iOS app: before every merge the worker builds the PR head, installs it fresh in an iOS simulator and drives the acceptance criteria there (worker section 5, 'Simulator review'). A passed simulator review of the head is part of the merge gate. Scheduled runs drive the app with xcrun simctl and the repo's UI tests; Claude Code's iOS Simulator tool is used only in attended runs. API-mode runs leave it for a Claude run. Off unless set.",
             "properties": {
               "build": { "type": "string", "description": "Command that builds the app for the simulator from the worktree ($WT), e.g. xcodebuild build with -destination 'platform=iOS Simulator,name=<device>' and -derivedDataPath $WT/build/autopilot-sim." },
               "app": { "type": "string", "description": "Path of the built .app, relative to $WT, e.g. build/autopilot-sim/Build/Products/Debug-iphonesimulator/MyApp.app." },
               "bundle_id": { "type": "string", "description": "The app's bundle id, to remove the app before each review so it starts from a fresh install. Default: read from the built app's Info.plist." },
-              "devices": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Simulator names or UDIDs. The first runs every review; the others only when a change is about layout or screen size (a small iPhone, an iPad). Prefer simulators of Autopilot's own, so the owner's are left alone. Each needs device access granted once, from an interactive session (docs/setup.md, section 8)." },
+              "devices": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Simulator names or UDIDs. The first runs every review; the others only when a change is about layout or screen size (a small iPhone, an iPad). Prefer simulators of Autopilot's own, so the owner's are left alone (docs/setup.md, section 8)." },
               "launch_args": { "type": "array", "items": { "type": "string" }, "description": "Arguments the app is launched with, e.g. a flag that skips onboarding." },
               "recipes": { "type": "array", "items": { "type": "string" }, "description": "Review tips the worker follows in the simulator, like preprod.recipes." }
             }

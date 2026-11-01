@@ -449,8 +449,11 @@ unless every repo the project starts may be public from its first commit.
 
 A native iOS app has no preprod web page to check in a browser. With `simulator_review` on a repo,
 every PR is run in an iOS simulator before it merges (worker section 5): the run builds the PR's head,
-installs it fresh, drives the acceptance criteria with Claude Code's iOS Simulator tool and looks at
-the screen after every step. A passed review of the head commit is part of the merge gate, next to the
+installs it fresh, exercises the acceptance criteria and looks at a screenshot of each. A scheduled run
+does it with `xcrun simctl` (launches with the arguments a screen needs, screenshots) and the repo's
+UI tests for taps and typing, adding a UI test to the PR when a criterion needs one. Claude Code's iOS
+Simulator tool refuses scheduled sessions; it is used only when you start a run yourself
+(`/autopilot:run` in an interactive session). A passed review of the head commit is part of the merge gate, next to the
 checks and the code review; any push needs a new one. The PR gets a `📱 Simulator review` comment with
 what was checked, and the screenshots go to `<reports.dir>/<issue>/simulator/`.
 
@@ -473,14 +476,21 @@ Set up once, on the Mac the runs use:
    xcrun simctl create "Autopilot iPad" "iPad Pro 11-inch (M5)"
    ```
    `xcrun simctl list devicetypes` lists the models. Never sign them in to an Apple ID.
-2. **Device access.** Claude Code asks once per simulator before its tool may drive it, and an
-   unattended run can't answer. In an interactive Claude Code session (desktop app), ask Claude to
-   attach to each `devices` simulator and allow the prompt. Until then a review blocks and asks you.
-3. **Release checks.** What a simulator can't show (camera, a document scanner, push, iCloud between
+2. **Clipboard sync off.** Simulator.app copies your Mac's clipboard into every simulator, so an app that
+   reads the clipboard shows a paste prompt on each launch and UI tests hang on it. Turn off Edit →
+   Automatically Sync Pasteboard in Simulator.app, or:
+   ```bash
+   defaults write com.apple.iphonesimulator PasteboardAutomaticSync -bool false
+   ```
+   With it on, a run quits Simulator.app when it meets the prompt (the simulators keep running).
+3. **Device access (only for runs you start yourself).** Claude Code asks once per simulator before its
+   tool may drive it. In the desktop app's simulator panel, attach each `devices` simulator and click
+   "Let Claude use it". Scheduled runs don't use the tool and need no access.
+4. **Release checks.** What a simulator can't show (camera, a document scanner, push, iCloud between
    devices) goes on `linear.release_checks_project` for the next TestFlight build; without that
    project, such a change blocks with the exact check.
 
 Runs take turns on the simulators (the `simulator` lock): a run holds it for the review and for any
-of the repo's `checks` that run on a simulator. API-mode runs have no simulator tool: they leave the
-review, and the merge, for the next Claude run. Releases stay yours; put the upload commands
+of the repo's `checks` that run on a simulator. API-mode runs leave the review, and the merge, for the
+next Claude run. Releases stay yours; put the upload commands
 (`xcodebuild -exportArchive`, `xcrun altool`, …) in `forbidden.commands`.

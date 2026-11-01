@@ -200,3 +200,14 @@ turns it off.
 - **Two green PRs are not a green pair.** Two PRs to one API repo each
   passed CI against their own base and were merged 5 s apart; together they failed the preprod
   deploy's tests. The base guard also requires the merged head to contain the current base.
+
+## Scheduled runs can't drive a simulator with Claude Code's tool (2026-11-01)
+
+The first simulator review (0.21.0) assumed a scheduled run could tap through an iOS app with Claude
+Code's iOS Simulator tool. It can't: the tool answers "Mobile simulator tools require an attended
+session" in scheduled and remotely dispatched sessions, whatever device access was granted. The run
+built the fix, its tests and screenshots on every device, then blocked on the owner. Since 0.21.1 an
+unattended review uses what any developer has on the Mac: `xcrun simctl` to launch and screenshot,
+and UI tests for the taps, with each screenshot looked at, not just the assertions. The same run hit a
+second trap: Simulator.app syncs the Mac's clipboard into the simulator, so an app that reads it shows a
+paste prompt on every launch and UI tests hang. Clipboard sync is off in the setup steps.
