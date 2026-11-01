@@ -252,7 +252,7 @@ before the webhook secret reached the Worker, shows an error; that's expected.)
    | Section | Set |
    |---|---|
    | `linear` | the team key, the Linear projects Autopilot takes issues from, your workflow state names, the owner who answers questions |
-   | `repos` | each repo's GitHub name, local clone path, setup and check commands, house rules and notes |
+   | `repos` | each repo's GitHub name, local clone path, setup and check commands, house rules and notes; for an iOS app, `simulator_review` ([setup](setup.md#8-simulator-review-for-ios-apps-optional-since-0210), [example](../examples/ios-app/autopilot.yaml)) |
    | `merge` | merge policy, review depth, review model |
    | `preprod` | the preprod URL, test users, and how to verify a change in a browser; optionally `sign_in`, so runs sign a test user back in with Passhand ([setup](setup.md#5-preprod-sign-in-with-passhand-optional-since-0170)), and `browser_host`, a Chromium of Autopilot's own for drivers that connect over CDP, such as Playwright MCP ([setup](setup.md#6-browser-host-for-cdp-drivers-optional-since-0180)) |
    | `forbidden` | production hosts, cloud projects, commands and workflows it must never touch |

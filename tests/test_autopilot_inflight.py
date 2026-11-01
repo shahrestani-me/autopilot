@@ -295,6 +295,10 @@ class ParallelTests(unittest.TestCase):
         self.assertGreaterEqual(clock[0], 30)
         api.unlock("verify", out["token"])
         self.assertTrue(api.lock("verify")["locked"])
+        sim = api.lock("simulator")  # the simulator review's own lock, apart from the browser's
+        self.assertTrue(sim["locked"])
+        self.assertFalse(api.lock("simulator")["locked"])
+        self.assertNotIn("simulator", api.locked_issues())
         with self.assertRaises(SystemExit):
             api.lock("../etc")
 

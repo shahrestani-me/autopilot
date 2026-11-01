@@ -444,3 +444,43 @@ Without `new_repos`, an issue with a `New repo:` or `Add repo:` line blocks and 
 created or added from any other wording, or from a line someone other than the owner wrote. API-mode
 runs never create or add a repo: they leave it for the next Claude run. Keep `visibility: private`
 unless every repo the project starts may be public from its first commit.
+
+## 8. Simulator review for iOS apps (optional, since 0.21.0)
+
+A native iOS app has no preprod web page to check in a browser. With `simulator_review` on a repo,
+every PR is run in an iOS simulator before it merges (worker section 5): the run builds the PR's head,
+installs it fresh, drives the acceptance criteria with Claude Code's iOS Simulator tool and looks at
+the screen after every step. A passed review of the head commit is part of the merge gate, next to the
+checks and the code review; any push needs a new one. The PR gets a `📱 Simulator review` comment with
+what was checked, and the screenshots go to `<reports.dir>/<issue>/simulator/`.
+
+```yaml
+repos:
+  - name: ios-app
+    setup: ["cd $WT && xcodegen generate --quiet"]    # if the .xcodeproj is generated
+    simulator_review:
+      build: "xcodebuild build -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -derivedDataPath $WT/build/autopilot-sim"
+      app: build/autopilot-sim/Build/Products/Debug-iphonesimulator/App.app
+      devices: ["Autopilot iPhone", "Autopilot iPad"]  # the first always; the others for layout changes
+      recipes: ["Tap \"Load example data\" on the welcome screen for sample content."]
+```
+
+Set up once, on the Mac the runs use:
+
+1. **Simulators of Autopilot's own**, so it never touches yours (their data, an Apple ID signed in):
+   ```bash
+   xcrun simctl create "Autopilot iPhone" "iPhone 17 Pro"
+   xcrun simctl create "Autopilot iPad" "iPad Pro 11-inch (M5)"
+   ```
+   `xcrun simctl list devicetypes` lists the models. Never sign them in to an Apple ID.
+2. **Device access.** Claude Code asks once per simulator before its tool may drive it, and an
+   unattended run can't answer. In an interactive Claude Code session (desktop app), ask Claude to
+   attach to each `devices` simulator and allow the prompt. Until then a review blocks and asks you.
+3. **Release checks.** What a simulator can't show (camera, a document scanner, push, iCloud between
+   devices) goes on `linear.release_checks_project` for the next TestFlight build; without that
+   project, such a change blocks with the exact check.
+
+Runs take turns on the simulators (the `simulator` lock): a run holds it for the review and for any
+of the repo's `checks` that run on a simulator. API-mode runs have no simulator tool: they leave the
+review, and the merge, for the next Claude run. Releases stay yours; put the upload commands
+(`xcodebuild -exportArchive`, `xcrun altool`, …) in `forbidden.commands`.

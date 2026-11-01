@@ -98,6 +98,21 @@ class ConfigSchemaTests(unittest.TestCase):
                 with self.assertRaises(jsonschema.ValidationError):
                     jsonschema.validate(cfg, schema)
 
+    def test_simulator_review(self):
+        schema = json.loads((ROOT / "schema" / "autopilot.schema.json").read_text())
+        cfg = yaml.safe_load((ROOT / "examples" / "ios-app" / "autopilot.yaml").read_text())
+        self.assertNotIn("preprod", cfg)  # the simulator review before the merge is the app's only review
+        repo = cfg["repos"][0]
+        self.assertTrue(repo["simulator_review"]["devices"])
+        web = yaml.safe_load((ROOT / "examples" / "web-app" / "autopilot.yaml").read_text())
+        self.assertFalse(any("simulator_review" in r for r in web["repos"]))  # opt-in
+        for bad in ({"build": "x", "app": "A.app", "devices": []}, {"build": "x", "devices": ["d"]},
+                    {"build": "x", "app": "A.app", "devices": ["d"], "device": "d"}):
+            with self.subTest(simulator_review=bad):
+                repo["simulator_review"] = bad
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(cfg, schema)
+
 def _linear_schema():
     path = os.environ.get("LINEAR_SCHEMA")
     if path:
