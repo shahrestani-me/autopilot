@@ -79,8 +79,9 @@ docs/setup.md). It runs on OpenRouter, one model per role: you are the orchestra
 - Spend: the supervisor stops the whole run once its OpenRouter spend passes `$AUTOPILOT_FALLBACK_USD`.
   Give `"$CODER" run --max-usd` at most half of it. Other paid spend (Gemini/Vertex) keeps its own
   cap, `spend.paid_model_usd_per_ticket`.
-- A step that needs Claude or the owner's browser (preprod verification in `chrome`): don't fake it.
-  Return `blocked`, "merged; <step> waits for a Claude run", `wait: claude`. The next Claude run
+- A step that needs Claude or the owner's browser (preprod verification in `chrome`, a simulator review
+  before a merge): don't fake it. Return `blocked`, "merged; <step> waits for a Claude run" (without
+  "merged; " when nothing is merged yet), `wait: claude`. The next Claude run
   picks it up by itself (section 2, step 4). Not the owner's problem: no elicitation, no tag.
 
 ## 0. Gate and lock

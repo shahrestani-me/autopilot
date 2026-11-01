@@ -1,0 +1,56 @@
+# A made-up native iOS app with no preprod: every change is reviewed in an iOS simulator before it
+# merges (worker section 5, "Simulator review"). Copy it to ~/.config/autopilot/projects/<name>.yaml
+# and replace each value with your project's. Releases (TestFlight, App Store) stay the owner's.
+version: 1
+name: ios-app
+description: Example iOS app (SwiftUI, XcodeGen), reviewed in the simulator; no preprod.
+
+linear:
+  team: ENG
+  projects: ["iOS App"]
+  states:
+    in_progress: In Progress
+    merged: In Review
+    done: Done
+    blocked: Blocked
+  followup_state: Backlog
+  owner: Jane Doe
+  release_checks_project: iOS App Release   # device-only checks (camera, iCloud) for the next TestFlight build
+
+repos:
+  - name: ios-app
+    github: example-org/ios-app
+    path: ~/src/ios-app
+    role: iOS app (Swift 6, SwiftUI, XcodeGen; project.yml generates the .xcodeproj)
+    setup:
+      - cd $WT && xcodegen generate --quiet
+    checks:
+      - cd $WT/Packages/Core && swift test
+      - "cd $WT && xcodebuild test -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -derivedDataPath $WT/build/autopilot-sim -only-testing:AppTests"
+    simulator_review:
+      build: "xcodebuild build -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -derivedDataPath $WT/build/autopilot-sim"
+      app: build/autopilot-sim/Build/Products/Debug-iphonesimulator/App.app
+      bundle_id: com.example.app
+      devices: ["Autopilot iPhone", "Autopilot iPad"]   # simulators of Autopilot's own (docs/setup.md, section 8)
+      recipes:
+        - A fresh install starts on the welcome screen; tap "Load example data" to get sample content.
+        - Photo import needs a picture in the simulator's library; add one with `xcrun simctl addmedia "<device>" <file>`.
+    notes:
+      - Every user-facing string goes in Localizable.xcstrings with all supported languages.
+
+git:
+  branch_prefix: autopilot/
+  worktree_root: ~/src/.autopilot-worktrees
+
+merge:
+  policy: merge-all
+  max_ci_cycles: 3
+  max_review_loops: 3
+  reviewer_model: sonnet
+  code_review: high
+
+forbidden:
+  commands: ["xcodebuild -exportArchive", "xcrun altool", "fastlane"]   # no uploads to App Store Connect
+
+reports:
+  dir: ~/.local/state/autopilot/reports

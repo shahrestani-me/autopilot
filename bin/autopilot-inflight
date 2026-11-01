@@ -32,7 +32,8 @@ for the owner: their reply arrives as a gateway job for that issue.
       for the hooks to show in the issue's Linear session. The slot number isn't tied to the task.
   autopilot-inflight lock NAME [--wait SECONDS] | lock NAME --touch --token T | unlock NAME --token T
       An exclusive lock: an issue id while a run works on it, or "verify" (the preprod browser and
-      test user) and "keepalive". {"locked": true, "token": T} or {"locked": false, "holder": ...}.
+      test user), "simulator" (the iOS simulators of a simulator review) and "keepalive".
+      {"locked": true, "token": T} or {"locked": false, "holder": ...}.
   Every lock and slot has an owner token: only its holder can touch or release it. One not touched
   for LOCK_STALE_S (2 h) belongs to a run that died and is taken over (one taker at a time).
   autopilot-inflight overlap <ID> --files PATH [PATH ...]
@@ -79,7 +80,7 @@ AUTO_RETRY_CAP = 2   # automatic resumes of one issue without the owner, then it
 MAX_RUNS = int(os.environ.get("AUTOPILOT_MAX_RUNS") or 3)
 LOCK_STALE_S = 2 * 3600  # not touched this long: its run died (runs touch between phases)
 TAKEOVER_STALE_S = 60   # a takeover marker older than this belongs to a taker that died
-LOCK_NAME = re.compile(r"^(?:[A-Z][A-Z0-9]*-\d+|verify|keepalive)$")
+LOCK_NAME = re.compile(r"^(?:[A-Z][A-Z0-9]*-\d+|verify|simulator|keepalive)$")
 STALL_HOURS = 2      # checks pending this long while holding the slot → tell the owner
 # PRs Autopilot authored: its GitHub App's slug (Keychain autopilot-github/app-slug, or
 # AUTOPILOT_GITHUB_APP_SLUG), as `gh pr list --author app/<slug>` wants it.
@@ -622,7 +623,7 @@ def build_parser():
     sl.add_argument("n", nargs="?", type=int)
     sl.add_argument("--token")
     sl.add_argument("--agent", help="take: the scheduled task that started this run")
-    lk = sub.add_parser("lock", help="an exclusive lock: an issue id, verify or keepalive")
+    lk = sub.add_parser("lock", help="an exclusive lock: an issue id, verify, simulator or keepalive")
     lk.add_argument("name")
     lk.add_argument("--wait", type=int, default=0, help="seconds to wait for it")
     lk.add_argument("--touch", action="store_true", help="refresh a lock you hold (needs --token)")
