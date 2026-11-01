@@ -33,7 +33,7 @@ repos:
       bundle_id: com.example.app
       devices: ["Autopilot iPhone", "Autopilot iPad"]   # simulators of Autopilot's own (docs/setup.md, section 8)
       recipes:
-        - A fresh install starts on the welcome screen; tap "Load example data" to get sample content.
+        - A fresh install starts on the welcome screen; launch with -demoData YES for sample content.
         - Photo import needs a picture in the simulator's library; add one with `xcrun simctl addmedia "<device>" <file>`.
     notes:
       - Every user-facing string goes in Localizable.xcstrings with all supported languages.

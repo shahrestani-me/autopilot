@@ -393,25 +393,31 @@ checks passed, before the merge, and any push voids it, like a review round.
 5. `"$AP" activity <ID> --type thought --body "Simulator review of <H short> on <device>: <what>"`.
    Exercise each acceptance criterion the simulator can show, and follow **every**
    `simulator_review.recipes` line. Screenshots go to `<reports.dir>/<ID>/simulator/` (`mkdir -p`
-   it first), named `<H short>-<device>-<n>.png`.
+   it first), named `<H short>-<device, lower case, no spaces>-<n>.png`.
    - What a launch shows (a screen, a layout, a language, the app's state after launch arguments):
      relaunch with the arguments it needs, then `xcrun simctl io "<device>" screenshot <path>`.
-   - What needs taps, typing or gestures: unattended, a UI test (XCUITest) walks it. Use one the repo
-     has, or add one to the PR (it stays as a regression test; a new test goes through the review
-     round like any code). It calls `XCUIScreen.main.screenshot()` at each step that shows a
-     criterion and adds it as an `XCTAttachment` with `lifetime = .keepAlways`. Run it on the device
-     with `-only-testing:<target>/<class>/<test>` and
-     `-resultBundlePath $WT/build/autopilot-review-<n>.xcresult`, then
-     `xcrun xcresulttool export attachments --path <xcresult> --output-path <dir>`. Attended, drive
-     it with the tool instead (`tap`, `swipe`, `text`, `button`, `screenshot`).
+   - What needs taps, typing, gestures or rotation: unattended, a UI test (XCUITest) walks it, one the
+     repo has or one this PR added. Write such a test while implementing (section 3), so it is in the
+     PR before the review round; it stays as a regression test. Adding it only now is a push: a new
+     `H`, a new review round, then this review again. The test calls `XCUIScreen.main.screenshot()`
+     at each step that shows a criterion and adds it as an `XCTAttachment` with
+     `lifetime = .keepAlways` (rotation: `XCUIDevice.shared.orientation`). Run it like the repo's
+     simulator checks (same project, scheme and `-derivedDataPath`), with
+     `-destination 'platform=iOS Simulator,name=<device>'`, `-only-testing:<target>/<class>/<test>`
+     and `-resultBundlePath $WT/build/autopilot-review-<n>.xcresult`; then
+     `xcrun xcresulttool export attachments --path <xcresult> --output-path $WT/build/attachments-<n>`
+     and copy each PNG into the screenshot folder under the name above (its `manifest.json` maps the
+     files to the test's attachment names). Attended, drive it with the tool instead (`tap`, `swipe`,
+     `text`, `button`, `rotate`, `screenshot`).
    - **Look at every screenshot** (Read the PNG): what the screen shows is the result, not what the
      code or a passing assertion says. A green UI test without a screenshot that shows the criterion
      doesn't pass a visual criterion.
    - A system sheet over the app (paste, photos, notifications access): attended, tap it; in a UI
      test, tap its button through `XCUIApplication(bundleIdentifier: "com.apple.springboard")`. A paste
      prompt on every launch means the Mac's clipboard is synced into the simulator (docs/setup.md,
-     section 8): quit Simulator.app (`osascript -e 'quit app "Simulator"'`; the devices keep running)
-     and say so in the report.
+     section 8): empty the simulator's pasteboard before each launch
+     (`printf '' | xcrun simctl pbcopy "<device>"`), never quit Simulator.app (the owner may be using
+     it), and add one line to the report that clipboard sync is on.
    Use the app's own test data; never sign in to an Apple ID or any real account in the simulator.
 6. What a simulator can't show (camera, a document scanner, push, iCloud between devices, a real
    device's speed) is an owner-only check, as in section 7. The review passes only when at least one

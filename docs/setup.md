@@ -465,8 +465,12 @@ repos:
       build: "xcodebuild build -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -derivedDataPath $WT/build/autopilot-sim"
       app: build/autopilot-sim/Build/Products/Debug-iphonesimulator/App.app
       devices: ["Autopilot iPhone", "Autopilot iPad"]  # the first always; the others for layout changes
-      recipes: ["Tap \"Load example data\" on the welcome screen for sample content."]
+      recipes: ["Launch with -demoData YES for sample content."]
 ```
+
+Write `recipes` for scheduled runs, which have no tool to tap or rotate with: name the launch arguments
+that reach a state (demo data, a language), or the UI test that walks there (rotation in a UI test:
+`XCUIDevice.shared.orientation`).
 
 Set up once, on the Mac the runs use:
 
@@ -482,7 +486,7 @@ Set up once, on the Mac the runs use:
    ```bash
    defaults write com.apple.iphonesimulator PasteboardAutomaticSync -bool false
    ```
-   With it on, a run quits Simulator.app when it meets the prompt (the simulators keep running).
+   With it on, a run empties the simulator's pasteboard before each launch and notes it in the report.
 3. **Device access (only for runs you start yourself).** Claude Code asks once per simulator before its
    tool may drive it. In the desktop app's simulator panel, attach each `devices` simulator and click
    "Let Claude use it". Scheduled runs don't use the tool and need no access.
