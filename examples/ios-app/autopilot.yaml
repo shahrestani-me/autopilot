@@ -26,7 +26,7 @@ repos:
       - cd $WT && xcodegen generate --quiet
     checks:
       - cd $WT/Packages/Core && swift test
-      - "cd $WT && xcodebuild test -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -only-testing:AppTests"
+      - "cd $WT && xcodebuild test -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -derivedDataPath $WT/build/autopilot-sim -only-testing:AppTests"
     simulator_review:
       build: "xcodebuild build -quiet -project App.xcodeproj -scheme App -destination 'platform=iOS Simulator,name=Autopilot iPhone' -derivedDataPath $WT/build/autopilot-sim"
       app: build/autopilot-sim/Build/Products/Debug-iphonesimulator/App.app

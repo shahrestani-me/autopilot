@@ -309,7 +309,8 @@ gained `ci_review`).
 `ci_review.check` check: `ci_review.approver` approves the head when it passes, or requests changes
 and turns the check red. On such a repo run **no reviewer of your own**: no `code-review`, no
 correctness, design or security subagent, whatever the change touches and whatever a config note
-says (owner, 2026-10-21: "when we have review on CI, review in Autopilot is wrong").
+says. The simulator review below is not one of them: it runs the app, and a repo with
+`simulator_review` still needs it (owner, 2026-10-21: "when we have review on CI, review in Autopilot is wrong").
 With `ci_review.checks_attack_closed: true` the CI review also checks the PR's `## Attack closed`
 section against the diff and blocks when the attack isn't closed. So for an issue with an "Attack
 closed" section, make sure the PR description carries it, also on a PR an earlier run opened; if you
@@ -369,11 +370,12 @@ checks passed, before the merge, and any push voids it, like a review round.
    ToolSearch `select:mcp__Claude_Code_iOS_Simulator__control`). Not in this session, or an API-mode
    run → `blocked`, "simulator review of <H short> waits for a Claude run", `wait: claude`. Never
    merge without it.
-2. Take turns: `"$AI" lock simulator --wait 1800` (keep its token; touch your own locks after the
-   wait), and `"$AI" unlock simulator --token <it>` after the last step, also on failure. Still not
-   locked after 30 min → `blocked`, "simulator review waiting for the simulator", `wait: checkable`.
-3. Build `H`: `cd $WT && <simulator_review.build>`. A failed build is a failed check (section 4):
+2. Build `H`: `cd $WT && <simulator_review.build>`. A failed build is a failed check (section 4):
    fix, push, start again.
+3. Take turns on the simulators: `"$AI" lock simulator --wait 1800` (keep its token; touch your own
+   locks after the wait and between steps), and `"$AI" unlock simulator --token <it>` after the last
+   step, also on failure. Still not locked after 30 min → `blocked`, "simulator review waiting for the
+   simulator", `wait: checkable`.
 4. Device: `devices[0]`; the others too when the change is about layout or screen size.
    `xcrun simctl boot "<device>"` (already booted is fine), then a fresh install:
    `xcrun simctl uninstall "<device>" <bundle_id>` (`simulator_review.bundle_id`, else
@@ -387,16 +389,18 @@ checks passed, before the merge, and any push voids it, like a review round.
    Drive the app like a user with the tool (`screenshot`, `tap`, `swipe`, `text`, `button`), and
    follow **every** `simulator_review.recipes` line. Exercise each acceptance criterion the simulator
    can show, and look at a screenshot after every step: what the screen shows is the result, not what
-   the code should do. Save a screenshot for each criterion:
-   `xcrun simctl io "<device>" screenshot <reports.dir>/<ID>/simulator/<H short>-<n>.png`. Use the
-   app's own test data; never sign in to an Apple ID or any real account in the simulator.
+   the code should do. Save a screenshot for each criterion (`mkdir -p
+   <reports.dir>/<ID>/simulator` first): `xcrun simctl io "<device>" screenshot
+   <reports.dir>/<ID>/simulator/<H short>-<n>.png`. Use the app's own test data; never sign in to an
+   Apple ID or any real account in the simulator.
 6. What a simulator can't show (camera, a document scanner, push, iCloud between devices, a real
    device's speed) is an owner-only check, as in section 7. The review passes only when at least one
    acceptance criterion was exercised in the simulator and passed; the rest goes on the release
    checklist after the merge (section 8, step 3, with "reviewed in the simulator on <device> at
-   <H short>" in place of "verified on preprod as <user>"). Nothing could be shown in the simulator,
-   or the config has no `linear.release_checks_project` → `blocked` with the exact device check.
-7. `xcrun simctl shutdown "<device>"`, then unlock. Record it on the PR: `📱 Simulator review at
+   <H short>" in place of "verified on preprod as <user>"). `blocked` with the exact device check
+   when nothing could be shown in the simulator, or when such a device check is left and the config
+   has no `linear.release_checks_project`. A change the simulator showed in full needs neither.
+7. `xcrun simctl shutdown` each device you booted, then unlock. Record it on the PR: `📱 Simulator review at
    <H short> on <device> (iOS <version>): PASSED | FAILED`, then one line per criterion (steps →
    what the screen showed) and the screenshot paths. FAILED is a blocking finding: fix it and push;
    the new `H` needs its checks, a review round and a new simulator review. It counts against
@@ -492,8 +496,8 @@ Failed deploy: read the logs. If your change caused it, open **one** fix-forward
 ## 7. Verify on preprod
 
 Skip when `CFG.preprod` is absent (say so in the RESULT). A repo with `simulator_review` was already
-run in the app before the merge (section 5): the RESULT's `verification` names that review. Other runs share the browser and the test
-user, so take turns: `"$AI" lock verify --wait 1800` before opening the browser (keep its token), and
+run in the app before the merge (section 5): the RESULT's `verification` names that review. Other
+runs share the browser and the test user, so take turns: `"$AI" lock verify --wait 1800` before opening the browser (keep its token), and
 `"$AI" unlock verify --token <it>` right after the last check (also on failure). Touch your own locks
 after the wait. Still not locked after 30 min: return `blocked`, "merged; preprod verification waiting
 for the browser", `wait: checkable`. In an API-mode run without the browser tools (`chrome` needs
@@ -533,8 +537,8 @@ with exact screens, values and status codes.
 2. Follow-ups (out of scope, separate bugs) → new issues filed as Autopilot, never delegated to it:
    `"$AP" create --team <linear.team> --project "<project>" --state "<linear.followup_state>" --title "..." --body-file - <<'EOF'`
    with a link back to this issue in the body.
-3. **Release check** (only for the owner-only checks of section 7 or of a simulator review, section 5): one issue in the release project,
-   filed as Autopilot, never delegated to it. First look in this issue's comments for an Autopilot comment
+3. **Release check** (only for the owner-only checks of section 7 or of a simulator review, section
+   5): one issue in the release project, filed as Autopilot, never delegated to it. First look in this issue's comments for an Autopilot comment
    `📋 Release check: <ID2>` from an earlier run; if there is one, don't file a second. Otherwise:
 
    ```bash

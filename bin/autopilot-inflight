@@ -32,7 +32,8 @@ for the owner: their reply arrives as a gateway job for that issue.
       for the hooks to show in the issue's Linear session. The slot number isn't tied to the task.
   autopilot-inflight lock NAME [--wait SECONDS] | lock NAME --touch --token T | unlock NAME --token T
       An exclusive lock: an issue id while a run works on it, or "verify" (the preprod browser and
-      test user), "simulator" (the iOS simulators of a simulator review) and "keepalive". {"locked": true, "token": T} or {"locked": false, "holder": ...}.
+      test user), "simulator" (the iOS simulators of a simulator review) and "keepalive".
+      {"locked": true, "token": T} or {"locked": false, "holder": ...}.
   Every lock and slot has an owner token: only its holder can touch or release it. One not touched
   for LOCK_STALE_S (2 h) belongs to a run that died and is taken over (one taker at a time).
   autopilot-inflight overlap <ID> --files PATH [PATH ...]
